@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     RENDER_DATA_DIR=/data
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
+    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@openai/codex@${CODEX_VERSION}" \
     && python3 -m venv /opt/venv
