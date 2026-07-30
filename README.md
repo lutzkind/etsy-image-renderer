@@ -1,2 +1,2 @@
-# etsy-image-renderer
-Dedicated code-only local Codex image renderer for the Windmill Etsy automation pipeline.
+# etsy-codex-renderer
+Dedicated private local-Codex image renderer for the Windmill Etsy automation pipeline.

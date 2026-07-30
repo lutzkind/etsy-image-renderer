@@ -1,0 +1,28 @@
+services:
+  etsy-codex-renderer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      SERVICE_URL_ETSY_CODEX_RENDERER_8080: /
+      ETSY_CODEX_RENDERER_TOKEN: ${ETSY_CODEX_RENDERER_TOKEN:?required}
+      CODEX_HOME: /root/.codex
+      RENDER_DATA_DIR: /data
+      CODEX_RENDER_TIMEOUT_SECONDS: ${CODEX_RENDER_TIMEOUT_SECONDS:-900}
+    volumes:
+      - renderer-data:/data
+      - /root/.codex/auth.json:/root/.codex/auth.json:ro
+    networks:
+      - default
+      - windmill
+    expose:
+      - "8080"
+
+volumes:
+  renderer-data:
+
+networks:
+  windmill:
+    external: true
+    name: m9qaud6gadgni5bxty30bkdl
