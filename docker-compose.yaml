@@ -13,9 +13,6 @@ services:
     volumes:
       - renderer-data:/data
       - /root/.codex/auth.json:/root/.codex/auth.json:ro
-    networks:
-      - default
-      - windmill
     expose:
       - "8080"
 
@@ -23,6 +20,6 @@ volumes:
   renderer-data:
 
 networks:
-  windmill:
+  default:
     external: true
     name: m9qaud6gadgni5bxty30bkdl
