@@ -5,11 +5,11 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      SERVICE_URL_ETSY_CODEX_RENDERER_8080: /
-      ETSY_CODEX_RENDERER_TOKEN: ${ETSY_CODEX_RENDERER_TOKEN:?required}
-      CODEX_HOME: /root/.codex
-      RENDER_DATA_DIR: /data
-      CODEX_RENDER_TIMEOUT_SECONDS: ${CODEX_RENDER_TIMEOUT_SECONDS:-900}
+      - SERVICE_URL_ETSY_CODEX_RENDERER_8080=/
+      - ETSY_CODEX_RENDERER_TOKEN
+      - CODEX_HOME=/root/.codex
+      - RENDER_DATA_DIR=/data
+      - CODEX_RENDER_TIMEOUT_SECONDS
     volumes:
       - renderer-data:/data
       - /root/.codex/auth.json:/root/.codex/auth.json:ro
