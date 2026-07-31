@@ -290,6 +290,23 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                 mime, _ = _sniff_image(data)
                 unique[hashlib.sha256(data).hexdigest()] = (data, mime)
             if not unique:
+                workspace_files = []
+                for candidate in workspace.rglob("*"):
+                    if candidate.is_file():
+                        try:
+                            workspace_files.append({
+                                "path": str(candidate.relative_to(workspace)),
+                                "bytes": candidate.stat().st_size,
+                            })
+                        except OSError:
+                            pass
+                print(json.dumps({
+                    "event": "codex_render_output_missing",
+                    "returncode": result.returncode,
+                    "stdout_tail": (result.stdout or "")[-12000:],
+                    "stderr_tail": (result.stderr or "")[-6000:],
+                    "workspace_files": workspace_files[:50],
+                }, ensure_ascii=True), flush=True)
                 raise RuntimeError("output_missing")
             if len(unique) != 1:
                 raise RuntimeError("output_ambiguous")
