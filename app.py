@@ -144,6 +144,9 @@ def _prompt(mode: str, context: str) -> str:
         "Use the built-in image_gen/image_generation tool exactly once. "
         "Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, "
         "placeholder art, or a programmatic drawing. Generate exactly one polished raster image. "
+        "After generation succeeds, use only a simple filesystem copy to place the exact generated raster "
+        "file at ./rendered-output.png in the current workspace. Do not redraw, convert, or re-encode it. "
+        "Do not finish until ./rendered-output.png exists. "
         "Do not add captions, logos, watermarks, signatures, prices, badges, or marketing text."
     )
     instructions = {
