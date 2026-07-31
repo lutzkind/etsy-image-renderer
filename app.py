@@ -211,7 +211,7 @@ def _new_outputs(workspace: Path, before: dict[str, tuple[int, int]], inputs: li
 
 def _codex_command(workspace: Path, inputs: list[Path]) -> list[str]:
     command = [
-        "codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write",
+        "codex", "exec", "--skip-git-repo-check", "--sandbox", "danger-full-access",
         "--ephemeral", "--enable", "image_generation", "-C", str(workspace), "--json",
     ]
     for path in inputs:
