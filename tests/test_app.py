@@ -19,7 +19,13 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_fixed_mode_input_counts():
-    assert renderer.EXPECTED_INPUTS == {"minimal_frame": 1, "lifestyle": 2, "orientation": 1}
+    assert renderer.EXPECTED_INPUTS == {
+        "minimal_frame": 1,
+        "lifestyle": 2,
+        "orientation": 1,
+        "before_after_card": 2,
+        "information_card": 2,
+    }
 
 
 def test_prompt_forbids_direct_api_fallback():
@@ -27,6 +33,14 @@ def test_prompt_forbids_direct_api_fallback():
     assert "built-in image_gen/image_generation tool exactly once" in prompt
     assert "Do not call an external image API" in prompt
     assert "Image 2" in prompt
+
+
+def test_card_prompts_keep_listing_artwork_as_image_two_and_ban_ai_text():
+    for mode in ("before_after_card", "information_card"):
+        prompt = renderer._prompt(mode, "topic=house portrait; style_fingerprint=abc; slot=15")
+        assert "Image 2" in prompt
+        assert "exact approved wording will be overlaid deterministically later" in prompt or "do not add" in prompt.lower()
+        assert "marketing text" in prompt
 
 
 def test_command_enables_image_generation(tmp_path):
@@ -73,3 +87,4 @@ def test_render_returns_one_mocked_image(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.content == PNG + b"output"
     assert response.headers["x-renderer"] == "codex-local"
+    assert response.headers["x-renderer-version"] == renderer.APP_VERSION

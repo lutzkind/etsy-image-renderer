@@ -18,11 +18,23 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
-ALLOWED_MODES = {"minimal_frame", "lifestyle", "orientation"}
-EXPECTED_INPUTS = {"minimal_frame": 1, "lifestyle": 2, "orientation": 1}
+ALLOWED_MODES = {
+    "minimal_frame",
+    "lifestyle",
+    "orientation",
+    "before_after_card",
+    "information_card",
+}
+EXPECTED_INPUTS = {
+    "minimal_frame": 1,
+    "lifestyle": 2,
+    "orientation": 1,
+    "before_after_card": 2,
+    "information_card": 2,
+}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 _RENDER_LOCK = threading.BoundedSemaphore(1)
 app = FastAPI(title="Etsy Codex Renderer", version=APP_VERSION)
@@ -31,7 +43,7 @@ app = FastAPI(title="Etsy Codex Renderer", version=APP_VERSION)
 class RenderRequest(BaseModel):
     mode: str
     input_urls: list[str]
-    context: str = Field(default="", max_length=500)
+    context: str = Field(default="", max_length=2000)
 
     @field_validator("mode")
     @classmethod
@@ -168,6 +180,21 @@ def _prompt(mode: str, context: str) -> str:
             "Image 1 is the exact finished artwork. Create one clean ecommerce presentation that clearly shows "
             "its full portrait or landscape composition at a large readable size. Use a neutral studio background "
             "and one restrained print or frame presentation. Do not crop important outer details."
+        ),
+        "before_after_card": (
+            "Image 1 is the exact source photograph for this listing. Image 2 is the exact finished listing artwork "
+            "created from the same subject and is the primary visual/style anchor. Create one polished, listing-specific "
+            "before-and-after ecommerce composition that presents both supplied images clearly and at useful size. "
+            "Preserve the source subject and the artwork faithfully; do not copy the artwork back into the source photo, "
+            "do not invent a different subject, and do not add extra panels, frames, captions, labels, or marketing text."
+        ),
+        "information_card": (
+            "Image 1 is a relevant source, mockup, or supporting context image for this exact listing. Image 2 is the "
+            "exact finished listing artwork and the primary visual/style anchor. Create one polished, listing-specific "
+            "visual information composition that uses Image 2 prominently and uses Image 1 to make the listing topic, "
+            "style, or workflow concrete. Preserve both supplied images faithfully, keep the artwork recognizable and "
+            "undistorted, and do not invent product claims or add captions, labels, logos, signatures, watermarks, "
+            "badges, prices, or marketing text; exact approved wording will be overlaid deterministically later."
         ),
     }
     suffix = f" Product context: {' '.join(context.split())[:500]}." if context.strip() else ""
@@ -350,6 +377,7 @@ async def render(
         headers={
             "Cache-Control": "no-store",
             "X-Renderer": "codex-local",
+            "X-Renderer-Version": APP_VERSION,
             "X-Render-Mode": request.mode,
             "X-Image-Sha256": digest,
         },
