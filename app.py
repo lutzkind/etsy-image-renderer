@@ -21,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
 ALLOWED_MODES = {
@@ -195,16 +195,18 @@ def _prompt(mode: str, context: str) -> str:
             "Image 2 is a style anchor only and must not be reproduced as a separate panel or copied as content. Preserve "
             "the source subject; do not invent a different subject. Never copy Image 2's words, names, dates, signatures, "
             "logos, watermarks, caption area, paper/mat edge, or border. Do not add extra panels, frames, captions, "
-            "labels, or marketing text."
+            "labels, blank poster areas, infographic cards, or marketing text. This is only the visual before/after "
+            "composition; exact approved labels will be overlaid deterministically later."
         ),
         "information_card": (
             "Image 1 is a relevant source, mockup, or supporting context image for this exact listing. Image 2 is the "
             "exact finished listing artwork and the primary visual/style anchor. Create one polished, listing-specific "
-            "visual information composition using Image 1 as the topic/context and Image 2 only for the artwork's "
+            "editorial supporting visual using Image 1 as the topic/context and Image 2 only for the artwork's "
             "medium, palette, texture, and line treatment. Do not reproduce Image 2 as a separate panel or copy its "
             "writing, names, dates, signatures, logos, watermarks, caption area, paper/mat edge, or border. Keep the "
             "listing subject recognizable and do not invent product claims or add captions, labels, logos, signatures, "
-            "watermarks, badges, prices, or marketing text; exact approved wording will be overlaid deterministically later."
+            "watermarks, badges, prices, marketing text, blank poster areas, oversized empty panels, or generic "
+            "infographic-card layouts; exact approved wording will be overlaid deterministically later."
         ),
     }
     suffix = f" Product context: {' '.join(context.split())[:500]}." if context.strip() else ""

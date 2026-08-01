@@ -41,6 +41,8 @@ def test_card_prompts_keep_listing_artwork_as_image_two_and_ban_ai_text():
         assert "Image 2" in prompt
         assert "exact approved wording will be overlaid deterministically later" in prompt or "do not add" in prompt.lower()
         assert "marketing text" in prompt
+        assert "blank poster" in prompt
+        assert "oversized empty panels" in prompt or "extra panels" in prompt
 
 
 def test_command_enables_image_generation(tmp_path):
