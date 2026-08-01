@@ -21,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
 ALLOWED_MODES = {
@@ -177,10 +177,13 @@ def _prompt(mode: str, context: str) -> str:
             "Do not invent a different artwork and do not add additional frames."
         ),
         "lifestyle": (
-            "Image 1 is the original interior photograph. Image 2 is the exact finished artwork. Place Image 2 "
-            "naturally in the clearest existing framed-art or wall-display area. Preserve the room, furniture, "
-            "camera angle, lighting, frame edges, mat, shadows, and reflections. Preserve the artwork exactly; "
-            "do not redesign the room or artwork and do not add extra frames."
+            "Image 1 is the original interior photograph and Image 2 is the exact finished artwork to be inserted. "
+            "Image 2 is the ground-truth artwork content: place that artwork, with its subject, colors, composition, "
+            "and any intentional approved text preserved, into the clearest existing framed-art or wall-display area. "
+            "The art already visible in Image 1 is only a physical placement target; do not copy, reinterpret, or "
+            "replace Image 2 with it. If the target frame already contains art, replace only the visible art content "
+            "inside that frame with Image 2 while preserving the frame, mat, room, furniture, camera angle, lighting, "
+            "shadows, and reflections. Do not redesign the room or artwork and do not add extra frames."
         ),
         "orientation": (
             "Image 1 is the exact finished artwork. Create one clean ecommerce presentation that clearly shows "

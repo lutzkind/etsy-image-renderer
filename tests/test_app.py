@@ -35,6 +35,13 @@ def test_prompt_forbids_direct_api_fallback():
     assert "Image 2" in prompt
 
 
+def test_lifestyle_prompt_treats_image_two_as_ground_truth():
+    prompt = renderer._prompt("lifestyle", "pet portrait")
+    assert "ground-truth artwork content" in prompt
+    assert "do not copy, reinterpret" in prompt
+    assert "replace only the visible art content" in prompt
+
+
 def test_card_prompts_keep_listing_artwork_as_image_two_and_ban_ai_text():
     for mode in ("before_after_card", "information_card"):
         prompt = renderer._prompt(mode, "topic=house portrait; style_fingerprint=abc; slot=15")
