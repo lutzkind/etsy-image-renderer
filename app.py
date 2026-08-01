@@ -11,11 +11,14 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
+import uuid
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 APP_VERSION = "1.1.1"
@@ -37,6 +40,9 @@ EXPECTED_INPUTS = {
 }
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 _RENDER_LOCK = threading.BoundedSemaphore(1)
+_ASYNC_JOBS: dict[str, dict] = {}
+_ASYNC_JOBS_LOCK = threading.Lock()
+ASYNC_JOB_TTL_SECONDS = 3600
 app = FastAPI(title="Etsy Codex Renderer", version=APP_VERSION)
 
 
@@ -355,6 +361,56 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
         _RENDER_LOCK.release()
 
 
+def _prune_async_jobs() -> None:
+    cutoff = time.time() - ASYNC_JOB_TTL_SECONDS
+    with _ASYNC_JOBS_LOCK:
+        for job_id, job in list(_ASYNC_JOBS.items()):
+            if float(job.get("created_at") or 0) < cutoff and job.get("status") in {"succeeded", "failed"}:
+                _ASYNC_JOBS.pop(job_id, None)
+
+
+def _run_async_job(job_id: str, request: RenderRequest) -> None:
+    with _ASYNC_JOBS_LOCK:
+        job = _ASYNC_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+    try:
+        data, mime, digest = _render(request)
+        with _ASYNC_JOBS_LOCK:
+            if job_id in _ASYNC_JOBS:
+                _ASYNC_JOBS[job_id].update({
+                    "status": "succeeded",
+                    "data": data,
+                    "mime": mime,
+                    "digest": digest,
+                })
+    except Exception as exc:
+        with _ASYNC_JOBS_LOCK:
+            if job_id in _ASYNC_JOBS:
+                _ASYNC_JOBS[job_id].update({"status": "failed", "error": str(exc)[:200]})
+
+
+def _async_job_response(job_id: str, job: dict):
+    status = str(job.get("status") or "queued")
+    if status in {"queued", "running"}:
+        return JSONResponse({"job_id": job_id, "status": status}, status_code=202)
+    if status == "failed":
+        raise HTTPException(status_code=503, detail=str(job.get("error") or "codex_render_failed"))
+    data = bytes(job.get("data") or b"")
+    return Response(
+        content=data,
+        media_type=str(job.get("mime") or "image/png"),
+        headers={
+            "Cache-Control": "no-store",
+            "X-Renderer": "codex-local",
+            "X-Renderer-Version": APP_VERSION,
+            "X-Render-Mode": str(job.get("mode") or ""),
+            "X-Image-Sha256": str(job.get("digest") or ""),
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return readiness()
@@ -386,3 +442,47 @@ async def render(
             "X-Image-Sha256": digest,
         },
     )
+
+
+@app.post("/render-async", status_code=202)
+def render_async(
+    request: RenderRequest,
+    authorization: str | None = Header(default=None),
+    x_renderer_token: str | None = Header(default=None),
+) -> JSONResponse:
+    _require_auth(authorization, x_renderer_token)
+    expected = EXPECTED_INPUTS[request.mode]
+    if len(request.input_urls) != expected:
+        raise HTTPException(status_code=400, detail="invalid_input_count")
+    try:
+        for url in request.input_urls:
+            _validate_public_https_url(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not readiness()["ready"]:
+        raise HTTPException(status_code=503, detail="renderer_not_ready")
+    _prune_async_jobs()
+    job_id = uuid.uuid4().hex
+    with _ASYNC_JOBS_LOCK:
+        _ASYNC_JOBS[job_id] = {
+            "status": "queued",
+            "created_at": time.time(),
+            "mode": request.mode,
+        }
+    threading.Thread(target=_run_async_job, args=(job_id, request), daemon=True).start()
+    return JSONResponse({"job_id": job_id, "status": "queued"}, status_code=202)
+
+
+@app.get("/render-async/{job_id}")
+def render_async_status(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    x_renderer_token: str | None = Header(default=None),
+):
+    _require_auth(authorization, x_renderer_token)
+    _prune_async_jobs()
+    with _ASYNC_JOBS_LOCK:
+        job = dict(_ASYNC_JOBS.get(str(job_id)) or {})
+    if not job:
+        raise HTTPException(status_code=404, detail="render_job_not_found")
+    return _async_job_response(str(job_id), job)

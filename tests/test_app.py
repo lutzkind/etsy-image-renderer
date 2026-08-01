@@ -58,6 +58,28 @@ def test_render_endpoint_requires_auth(monkeypatch):
     assert response.status_code == 401
 
 
+def test_async_render_queue_returns_completed_image(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    monkeypatch.setattr(renderer, "_render", lambda request: (PNG + b"async", "image/png", "digest"))
+    client = TestClient(renderer.app)
+    response = client.post(
+        "/render-async",
+        headers={"Authorization": "Bearer secret"},
+        json={"mode": "orientation", "input_urls": ["https://example.com/a.png"]},
+    )
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    for _ in range(20):
+        result = client.get(f"/render-async/{job_id}", headers={"Authorization": "Bearer secret"})
+        if result.status_code == 200:
+            break
+    assert result.status_code == 200
+    assert result.content == PNG + b"async"
+    assert result.headers["x-image-sha256"] == "digest"
+
+
 def test_render_returns_one_mocked_image(tmp_path, monkeypatch):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
