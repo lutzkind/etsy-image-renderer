@@ -186,15 +186,19 @@ def _prompt(mode: str, context: str) -> str:
             "created from the same subject and is the primary visual/style anchor. Create one polished, listing-specific "
             "before-and-after ecommerce composition that presents both supplied images clearly and at useful size. "
             "Preserve the source subject and the artwork faithfully; do not copy the artwork back into the source photo, "
-            "do not invent a different subject, and do not add extra panels, frames, captions, labels, or marketing text."
+            "do not invent a different subject. Use Image 2 only as the supplied artwork/style reference: do not copy "
+            "its words, names, dates, signatures, logos, watermarks, caption area, paper/mat edge, or border into the "
+            "new composition. Do not add extra panels, frames, captions, labels, or marketing text."
         ),
         "information_card": (
             "Image 1 is a relevant source, mockup, or supporting context image for this exact listing. Image 2 is the "
             "exact finished listing artwork and the primary visual/style anchor. Create one polished, listing-specific "
             "visual information composition that uses Image 2 prominently and uses Image 1 to make the listing topic, "
             "style, or workflow concrete. Preserve both supplied images faithfully, keep the artwork recognizable and "
-            "undistorted, and do not invent product claims or add captions, labels, logos, signatures, watermarks, "
-            "badges, prices, or marketing text; exact approved wording will be overlaid deterministically later."
+            "undistorted, but treat Image 2's writing, names, dates, signatures, logos, watermarks, caption area, "
+            "paper/mat edge, and border as reference-only elements that must not be copied. Do not invent product "
+            "claims or add captions, labels, logos, signatures, watermarks, badges, prices, or marketing text; "
+            "exact approved wording will be overlaid deterministically later."
         ),
     }
     suffix = f" Product context: {' '.join(context.split())[:500]}." if context.strip() else ""
