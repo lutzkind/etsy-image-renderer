@@ -25,6 +25,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout c20ea1b5cbd92f9fddd7b49cbeaf708310ef06f2 -- app.py Dockerfile requirements.txt .github/workflows/ci.yml
           git rm -f gateway.py tests/test_gateway.py
-          git rm -f .github/workflows/remove-unrelated-gateway.yml
           git commit -m "Remove unrelated Luna gateway from Etsy renderer"
           git push origin HEAD:main
