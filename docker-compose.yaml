@@ -18,10 +18,78 @@ services:
     networks:
       - windmill
 
+  codex-upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - openai-api-server-via-codex
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "18080"
+      - --api-key
+      - ${ETSY_CODEX_RENDERER_TOKEN}
+      - --max-concurrent-requests
+      - "4"
+      - --timeout
+      - "180"
+    restart: unless-stopped
+    environment:
+      - CODEX_HOME=/root/.codex
+    volumes:
+      - /root/.codex/auth.json:/root/.codex/auth.json:ro
+    expose:
+      - "18080"
+    networks:
+      - luna-private
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 20s
+
+  windmill-luna-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "gateway:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+    restart: unless-stopped
+    depends_on:
+      codex-upstream:
+        condition: service_healthy
+    environment:
+      - CODEX_UPSTREAM_API_KEY=${ETSY_CODEX_RENDERER_TOKEN}
+      - CODEX_UPSTREAM_URL=http://codex-upstream:18080/v1
+      - OPENAI_API_BASE_URL=https://api.openai.com/v1
+      - ALLOW_INBOUND_FALLBACK_KEY=true
+      - ALLOWED_MODELS=gpt-5.6-luna,luna-auto
+      - MODEL_ALIASES_JSON={"luna-auto":"gpt-5.6-luna"}
+      - PROVIDER_TIMEOUT_SECONDS=180
+      - MAX_CONCURRENCY=4
+      - TRANSIENT_FAILURE_THRESHOLD=3
+      - TRANSIENT_FAILURE_WINDOW_SECONDS=300
+      - TRANSIENT_OPEN_SECONDS=900
+      - QUOTA_OPEN_SECONDS=1800
+    expose:
+      - "8080"
+    networks:
+      - luna-private
+      - windmill
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 20s
+
 volumes:
   renderer-data:
 
 networks:
+  luna-private:
   windmill:
     external: true
     name: m9qaud6gadgni5bxty30bkdl
