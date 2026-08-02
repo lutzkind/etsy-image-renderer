@@ -8,15 +8,18 @@ from fastapi.testclient import TestClient
 import gateway
 
 
-def auth() -> dict[str, str]:
-    return {"Authorization": "Bearer sk-fallback-test"}
+def auth(*, gateway_token: str = "gateway-test") -> dict[str, str]:
+    return {
+        "Authorization": "Bearer sk-fallback-test",
+        "X-Luna-Gateway-Token": gateway_token,
+    }
 
 
 def client_for(monkeypatch, codex_call, api_call) -> TestClient:
     monkeypatch.setattr(gateway, "call_codex", codex_call)
     monkeypatch.setattr(gateway, "call_openai", api_call)
     monkeypatch.setattr(gateway, "OPENAI_KEY", "")
-    monkeypatch.setattr(gateway, "GATEWAY_TOKEN", "")
+    monkeypatch.setattr(gateway, "GATEWAY_TOKEN", "gateway-test")
     monkeypatch.setattr(gateway, "ALLOW_INBOUND_KEY", True)
     monkeypatch.setattr(gateway, "circuit", gateway.Circuit())
     return TestClient(gateway.app)
@@ -148,16 +151,45 @@ def test_invalid_structured_output_uses_api_fallback(monkeypatch):
     assert response.headers["x-luna-gateway-fallback-reason"] == "invalid_success"
 
 
-def test_public_hostname_is_rejected(monkeypatch):
+def test_public_hostname_works_with_separate_gateway_token(monkeypatch):
+    async def codex_call(endpoint, payload, request_id):
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    async def api_call(*args, **kwargs):
+        raise AssertionError("fallback must not be called")
+
+    with client_for(monkeypatch, codex_call, api_call) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                **auth(),
+                "Host": "fwxnnc9hd9288dt66wqte5x2.luxeillum.com",
+            },
+            json={"model": "gpt-5.6-luna", "messages": []},
+        )
+
+    assert response.status_code == 200
+
+
+def test_missing_or_wrong_gateway_token_is_rejected(monkeypatch):
     async def unused(*args, **kwargs):
         raise AssertionError("provider must not be called")
 
     with client_for(monkeypatch, unused, unused) as client:
-        response = client.post(
+        missing = client.post(
             "/v1/chat/completions",
-            headers={**auth(), "Host": "fwxnnc9hd9288dt66wqte5x2.luxeillum.com"},
+            headers={"Authorization": "Bearer sk-fallback-test"},
+            json={"model": "gpt-5.6-luna", "messages": []},
+        )
+        wrong = client.post(
+            "/v1/chat/completions",
+            headers=auth(gateway_token="wrong"),
             json={"model": "gpt-5.6-luna", "messages": []},
         )
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "internal_gateway_only"
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert missing.json()["detail"] == "invalid_gateway_token"
