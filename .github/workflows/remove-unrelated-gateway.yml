@@ -1,4 +1,5 @@
 name: Remove unrelated gateway
+# One-shot cleanup trigger
 
 on:
   push:
