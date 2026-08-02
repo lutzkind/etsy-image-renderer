@@ -122,7 +122,7 @@ async def shutdown() -> None:
 
 @app.get("/health")
 async def health(request: Request) -> dict[str, Any]:
-    require_internal_host(request)
+    require_gateway_access(request)
     return {
         "status": "ok",
         "codex_transport": "embedded-openai-api-server-via-codex",
