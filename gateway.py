@@ -12,15 +12,26 @@ from typing import Any, Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from jsonschema import ValidationError, validate as validate_schema
+from openai_api_server_via_codex.server import create_app as create_codex_app
 
 Endpoint = Literal["chat", "responses"]
-CODEX_URL = os.getenv("CODEX_UPSTREAM_URL", "http://codex-upstream:18080/v1").rstrip("/")
-CODEX_KEY = os.getenv("CODEX_UPSTREAM_API_KEY", "").strip()
 OPENAI_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GATEWAY_TOKEN = os.getenv("LUNA_GATEWAY_TOKEN", "").strip()
-ALLOW_INBOUND_KEY = os.getenv("ALLOW_INBOUND_FALLBACK_KEY", "false").lower() in {"1", "true", "yes", "on"}
-ALLOWED_MODELS = {item.strip() for item in os.getenv("ALLOWED_MODELS", "gpt-5.6-luna,luna-auto").split(",") if item.strip()}
+ALLOW_INBOUND_KEY = os.getenv("ALLOW_INBOUND_FALLBACK_KEY", "true").lower() in {"1", "true", "yes", "on"}
+INTERNAL_HOSTS = {
+    item.strip().lower()
+    for item in os.getenv(
+        "LUNA_GATEWAY_INTERNAL_HOSTS",
+        "fwxnnc9hd9288dt66wqte5x2,fwxnnc9hd9288dt66wqte5x2:8080,testserver",
+    ).split(",")
+    if item.strip()
+}
+ALLOWED_MODELS = {
+    item.strip()
+    for item in os.getenv("ALLOWED_MODELS", "gpt-5.6-luna,luna-auto").split(",")
+    if item.strip()
+}
 MODEL_ALIASES = json.loads(os.getenv("MODEL_ALIASES_JSON", '{"luna-auto":"gpt-5.6-luna"}'))
 TIMEOUT = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "180"))
 MAX_BODY = int(os.getenv("MAX_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -29,6 +40,7 @@ QUOTA_OPEN_SECONDS = int(os.getenv("QUOTA_OPEN_SECONDS", "1800"))
 TRANSIENT_OPEN_SECONDS = int(os.getenv("TRANSIENT_OPEN_SECONDS", "900"))
 TRANSIENT_THRESHOLD = int(os.getenv("TRANSIENT_FAILURE_THRESHOLD", "3"))
 TRANSIENT_WINDOW = int(os.getenv("TRANSIENT_FAILURE_WINDOW_SECONDS", "300"))
+AUTH_OPEN_SECONDS = int(os.getenv("AUTH_OPEN_SECONDS", "300"))
 
 
 class Circuit:
@@ -55,8 +67,13 @@ class Circuit:
     async def fail(self, reason: str) -> None:
         async with self.lock:
             now = time.time()
-            if reason in {"quota", "auth"}:
-                self.open_until = now + (QUOTA_OPEN_SECONDS if reason == "quota" else 300)
+            if reason == "quota":
+                self.open_until = now + QUOTA_OPEN_SECONDS
+                self.reason = reason
+                self.failures.clear()
+                return
+            if reason == "auth":
+                self.open_until = now + AUTH_OPEN_SECONDS
                 self.reason = reason
                 self.failures.clear()
                 return
@@ -73,27 +90,45 @@ class Circuit:
 
     async def state(self) -> dict[str, Any]:
         skip, reason = await self.skip()
-        return {"open": skip, "reason": reason, "open_until": self.open_until if skip else None}
+        return {
+            "open": skip,
+            "reason": reason,
+            "open_until": self.open_until if skip else None,
+        }
 
 
+codex_app = create_codex_app(
+    timeout=TIMEOUT,
+    max_concurrent_requests=MAX_CONCURRENCY,
+    max_stored_items=0,
+)
+codex_client = httpx.AsyncClient(
+    transport=httpx.ASGITransport(app=codex_app),
+    base_url="http://codex.internal",
+    timeout=httpx.Timeout(TIMEOUT),
+)
+api_client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT), follow_redirects=False)
 app = FastAPI(title="Windmill Luna Gateway", version="1.0.0")
-client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT), follow_redirects=False)
 circuit = Circuit()
 semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    await client.aclose()
+    await codex_client.aclose()
+    await api_client.aclose()
 
 
 @app.get("/health")
-async def health() -> dict[str, Any]:
+async def health(request: Request) -> dict[str, Any]:
+    require_internal_host(request)
     return {
         "status": "ok",
-        "codex_configured": bool(CODEX_KEY),
+        "codex_transport": "embedded-openai-api-server-via-codex",
         "api_fallback_configured": bool(OPENAI_KEY or ALLOW_INBOUND_KEY),
-        "fallback_key_mode": "configured" if OPENAI_KEY else ("inbound_bearer" if ALLOW_INBOUND_KEY else "disabled"),
+        "fallback_key_mode": "configured" if OPENAI_KEY else (
+            "inbound_bearer" if ALLOW_INBOUND_KEY else "disabled"
+        ),
         "circuit": await circuit.state(),
     }
 
@@ -110,7 +145,7 @@ async def responses(request: Request) -> Response:
 
 async def handle(request: Request, endpoint: Endpoint) -> Response:
     bearer = authenticate(request)
-    payload = await body(request)
+    payload = await read_body(request)
     model = payload.get("model")
     if not isinstance(model, str) or model not in ALLOWED_MODELS:
         raise HTTPException(400, "model_not_allowed")
@@ -123,7 +158,7 @@ async def handle(request: Request, endpoint: Endpoint) -> Response:
     async with semaphore:
         skip, skip_reason = await circuit.skip()
         if not skip:
-            primary = await call(CODEX_URL, CODEX_KEY, endpoint, payload, request_id)
+            primary = await call_codex(endpoint, payload, request_id)
             reason = failure_reason(primary)
             if reason is None and primary is not None:
                 invalid = invalid_success(primary, endpoint, payload)
@@ -138,18 +173,32 @@ async def handle(request: Request, endpoint: Endpoint) -> Response:
         else:
             fallback_reason = f"circuit_open:{skip_reason or 'unknown'}"
 
-        fallback = await call(OPENAI_URL, fallback_key, endpoint, payload, request_id)
+        fallback = await call_openai(fallback_key, endpoint, payload, request_id)
         if fallback is None:
             return Response(
-                json.dumps({"error": {"message": "Both providers unavailable", "type": "gateway_provider_error"}}),
-                502,
-                headers=headers("none", True, fallback_reason, request_id),
+                json.dumps(
+                    {
+                        "error": {
+                            "message": "Both providers unavailable",
+                            "type": "gateway_provider_error",
+                        }
+                    }
+                ),
+                status_code=502,
+                headers=gateway_headers("none", True, fallback_reason, request_id),
                 media_type="application/json",
             )
         return relay(fallback, "openai-api", True, fallback_reason, request_id)
 
 
+def require_internal_host(request: Request) -> None:
+    host = request.headers.get("host", "").strip().lower()
+    if host not in INTERNAL_HOSTS:
+        raise HTTPException(403, "internal_gateway_only")
+
+
 def authenticate(request: Request) -> str:
+    require_internal_host(request)
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(401, "unauthorized")
@@ -161,7 +210,7 @@ def authenticate(request: Request) -> str:
     return token
 
 
-async def body(request: Request) -> dict[str, Any]:
+async def read_body(request: Request) -> dict[str, Any]:
     raw = await request.body()
     if len(raw) > MAX_BODY:
         raise HTTPException(413, "request_too_large")
@@ -174,14 +223,39 @@ async def body(request: Request) -> dict[str, Any]:
     return value
 
 
-async def call(base: str, key: str, endpoint: Endpoint, payload: dict[str, Any], request_id: str) -> httpx.Response | None:
+async def call_codex(
+    endpoint: Endpoint,
+    payload: dict[str, Any],
+    request_id: str,
+) -> httpx.Response | None:
+    path = "/v1/chat/completions" if endpoint == "chat" else "/v1/responses"
+    try:
+        return await codex_client.post(
+            path,
+            headers={"X-Request-ID": request_id},
+            json=payload,
+        )
+    except httpx.HTTPError:
+        return None
+
+
+async def call_openai(
+    key: str,
+    endpoint: Endpoint,
+    payload: dict[str, Any],
+    request_id: str,
+) -> httpx.Response | None:
     if not key:
         return None
     path = "/chat/completions" if endpoint == "chat" else "/responses"
     try:
-        return await client.post(
-            base + path,
-            headers={"Authorization": f"Bearer {key}", "X-Request-ID": request_id},
+        return await api_client.post(
+            OPENAI_URL + path,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "X-Request-ID": request_id,
+                "Content-Type": "application/json",
+            },
             json=payload,
         )
     except httpx.HTTPError:
@@ -196,7 +270,14 @@ def failure_reason(response: httpx.Response | None) -> str | None:
     if status in {401, 403}:
         return "auth"
     if status == 429:
-        quota_words = ("usage limit", "quota", "plan limit", "limit reached", "insufficient_quota", "codex usage")
+        quota_words = (
+            "usage limit",
+            "quota",
+            "plan limit",
+            "limit reached",
+            "insufficient_quota",
+            "codex usage",
+        )
         return "quota" if any(word in text for word in quota_words) else "rate_limit"
     if status == 408:
         return "timeout"
@@ -205,7 +286,11 @@ def failure_reason(response: httpx.Response | None) -> str | None:
     return None
 
 
-def invalid_success(response: httpx.Response, endpoint: Endpoint, request: dict[str, Any]) -> str | None:
+def invalid_success(
+    response: httpx.Response,
+    endpoint: Endpoint,
+    request: dict[str, Any],
+) -> str | None:
     if not 200 <= response.status_code < 300:
         return None
     try:
@@ -223,7 +308,15 @@ def invalid_success(response: httpx.Response, endpoint: Endpoint, request: dict[
         if not isinstance(message, dict):
             return "missing_message"
         content = message.get("content")
-        text = content if isinstance(content, str) else None
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = [
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict)
+            ]
+            text = "".join(parts) if parts else None
         if text is None and not message.get("tool_calls") and not message.get("function_call"):
             return "empty_chat_success"
     else:
@@ -279,7 +372,12 @@ def structured_error(request: dict[str, Any], text: str | None) -> str | None:
     return None
 
 
-def headers(provider: str, fallback: bool, reason: str | None, request_id: str) -> dict[str, str]:
+def gateway_headers(
+    provider: str,
+    fallback: bool,
+    reason: str | None,
+    request_id: str,
+) -> dict[str, str]:
     result = {
         "X-Luna-Gateway-Provider": provider,
         "X-Luna-Gateway-Fallback": "true" if fallback else "false",
@@ -287,14 +385,20 @@ def headers(provider: str, fallback: bool, reason: str | None, request_id: str) 
         "Cache-Control": "no-store",
     }
     if reason:
-        result["X-Luna-Gateway-Fallback-Reason"] = reason
+        result["X-Luna-Gateway-Fallback-Reason"] = reason[:200]
     return result
 
 
-def relay(upstream: httpx.Response, provider: str, fallback: bool, reason: str | None, request_id: str) -> Response:
+def relay(
+    upstream: httpx.Response,
+    provider: str,
+    fallback: bool,
+    reason: str | None,
+    request_id: str,
+) -> Response:
     return Response(
         upstream.content,
-        upstream.status_code,
-        headers=headers(provider, fallback, reason, request_id),
+        status_code=upstream.status_code,
+        headers=gateway_headers(provider, fallback, reason, request_id),
         media_type=upstream.headers.get("content-type", "application/json").split(";", 1)[0],
     )
