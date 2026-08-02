@@ -19,11 +19,12 @@ OPENAI_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/v1").rstri
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GATEWAY_TOKEN = os.getenv("LUNA_GATEWAY_TOKEN", "").strip()
 ALLOW_INBOUND_KEY = os.getenv("ALLOW_INBOUND_FALLBACK_KEY", "true").lower() in {"1", "true", "yes", "on"}
-INTERNAL_HOSTS = {
+ALLOWED_HOSTS = {
     item.strip().lower()
     for item in os.getenv(
-        "LUNA_GATEWAY_INTERNAL_HOSTS",
-        "fwxnnc9hd9288dt66wqte5x2,fwxnnc9hd9288dt66wqte5x2:8080,testserver",
+        "LUNA_GATEWAY_ALLOWED_HOSTS",
+        "fwxnnc9hd9288dt66wqte5x2,fwxnnc9hd9288dt66wqte5x2:8080,"
+        "fwxnnc9hd9288dt66wqte5x2.luxeillum.com,testserver",
     ).split(",")
     if item.strip()
 }
