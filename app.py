@@ -505,3 +505,10 @@ def render_async_status(job_id: str, authorization: str | None = Header(default=
     if not job:
         raise HTTPException(status_code=404, detail="render_job_not_found")
     return _async_job_response(str(job_id), job)
+
+
+# Keep the Etsy renderer routes unchanged while exposing the internal-only
+# Codex-primary Luna gateway under a separate path.
+from gateway import app as luna_gateway_app
+
+app.mount("/luna", luna_gateway_app)
