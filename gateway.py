@@ -192,23 +192,23 @@ async def handle(request: Request, endpoint: Endpoint) -> Response:
         return relay(fallback, "openai-api", True, fallback_reason, request_id)
 
 
-def require_internal_host(request: Request) -> None:
+def require_gateway_access(request: Request) -> None:
     host = request.headers.get("host", "").strip().lower()
-    if host not in INTERNAL_HOSTS:
-        raise HTTPException(403, "internal_gateway_only")
+    if host not in ALLOWED_HOSTS:
+        raise HTTPException(403, "gateway_host_not_allowed")
+    if not GATEWAY_TOKEN:
+        raise HTTPException(503, "gateway_not_configured")
+    supplied = request.headers.get("x-luna-gateway-token", "").strip()
+    if not supplied or not hmac.compare_digest(supplied, GATEWAY_TOKEN):
+        raise HTTPException(401, "invalid_gateway_token")
 
 
 def authenticate(request: Request) -> str:
-    require_internal_host(request)
+    require_gateway_access(request)
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not token:
-        raise HTTPException(401, "unauthorized")
-    token = token.strip()
-    if GATEWAY_TOKEN and not hmac.compare_digest(token, GATEWAY_TOKEN):
-        raise HTTPException(401, "unauthorized")
-    if not GATEWAY_TOKEN and not ALLOW_INBOUND_KEY:
-        raise HTTPException(503, "gateway_not_configured")
-    return token
+        raise HTTPException(401, "missing_openai_fallback_key")
+    return token.strip()
 
 
 async def read_body(request: Request) -> dict[str, Any]:
