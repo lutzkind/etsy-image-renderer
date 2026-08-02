@@ -13,22 +13,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
-
       - name: Test renderer
-        id: renderer
-        continue-on-error: true
         run: pytest -q tests/test_app.py --junitxml=renderer-junit.xml
-
       - name: Test Luna gateway
-        id: gateway
-        continue-on-error: true
         run: pytest -q tests/test_gateway.py --junitxml=gateway-junit.xml
-
       - name: Build container
-        id: container
-        continue-on-error: true
         run: docker build --build-arg CODEX_VERSION=0.145.0 -t etsy-codex-renderer:test .
-
       - name: Upload CI diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -38,15 +28,3 @@ jobs:
             renderer-junit.xml
             gateway-junit.xml
           if-no-files-found: warn
-
-      - name: Enforce all checks
-        if: always()
-        env:
-          RENDERER_OUTCOME: ${{ steps.renderer.outcome }}
-          GATEWAY_OUTCOME: ${{ steps.gateway.outcome }}
-          CONTAINER_OUTCOME: ${{ steps.container.outcome }}
-        run: |
-          printf 'renderer=%s\ngateway=%s\ncontainer=%s\n' "$RENDERER_OUTCOME" "$GATEWAY_OUTCOME" "$CONTAINER_OUTCOME"
-          test "$RENDERER_OUTCOME" = success
-          test "$GATEWAY_OUTCOME" = success
-          test "$CONTAINER_OUTCOME" = success
