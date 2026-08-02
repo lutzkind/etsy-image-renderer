@@ -12,13 +12,22 @@ import app as renderer
 PNG = b"\x89PNG\r\n\x1a\n" + b"test"
 
 
+@pytest.fixture(autouse=True)
+def clear_request_cache():
+    renderer._REQUEST_DIGESTS.clear()
+    renderer._ASYNC_JOBS.clear()
+    yield
+    renderer._REQUEST_DIGESTS.clear()
+    renderer._ASYNC_JOBS.clear()
+
+
 def test_private_urls_are_rejected(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))])
     with pytest.raises(ValueError, match="input_url_not_public"):
         renderer._validate_public_https_url("https://example.test/a.png")
 
 
-def test_fixed_mode_input_counts():
+def test_mode_contracts_keep_exact_legacy_counts_and_add_structured_decorator():
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1,
         "lifestyle": 2,
@@ -26,30 +35,56 @@ def test_fixed_mode_input_counts():
         "before_after_card": 2,
         "information_card": 2,
     }
+    request = renderer.RenderRequest(
+        mode="decorative_asset",
+        expected_input_count=2,
+        asset_roles=[
+            {"role": "source_photo", "url": "https://example.com/source.jpg", "preservation": "subject_identity"},
+            {"role": "style_anchor", "url": "https://example.com/art.jpg", "preservation": "style_only"},
+        ],
+        prohibited_elements=renderer.STRICT_NO_TEXT,
+        module="photo_guide",
+        template_family="correct_wrong_photo_guide_v1",
+    )
+    assert request.input_urls == ["https://example.com/source.jpg", "https://example.com/art.jpg"]
+    assert renderer._role_contract(request)["contract_version"] == renderer.CONTRACT_VERSION
 
 
-def test_prompt_forbids_direct_api_fallback():
-    prompt = renderer._prompt("lifestyle", "pet portrait")
+def test_decorative_request_rejects_missing_no_text_contract():
+    with pytest.raises(ValueError, match="strict_no_text"):
+        renderer.RenderRequest(
+            mode="decorative_asset",
+            expected_input_count=1,
+            asset_roles=[{"role": "source_photo", "url": "https://example.com/source.jpg"}],
+            prohibited_elements=["text"],
+        )
+
+
+def test_prompt_forbids_direct_api_fallback_and_generic_panels():
+    request = renderer.RenderRequest(
+        mode="decorative_asset",
+        expected_input_count=2,
+        asset_roles=[
+            {"role": "source_photo", "url": "https://example.com/source.jpg", "preservation": "subject_identity"},
+            {"role": "listing_artwork", "url": "https://example.com/art.jpg", "exact_pixel_preservation": True, "transform_allowed": False},
+        ],
+        prohibited_elements=renderer.STRICT_NO_TEXT,
+        module="photo_guide",
+        template_family="correct_wrong_photo_guide_v1",
+    )
+    prompt = renderer._prompt(request)
     assert "built-in image_gen/image_generation tool exactly once" in prompt
     assert "Do not call an external image API" in prompt
-    assert "Image 2" in prompt
+    assert "EXACT PIXEL PRESERVATION REQUIRED" in prompt
+    assert "blank caption sheets" in prompt
+    assert "generic information panel" in prompt
+    assert "STRUCTURED INPUT CONTRACT" in prompt
 
 
-def test_lifestyle_prompt_treats_image_two_as_ground_truth():
+def test_legacy_lifestyle_prompt_keeps_image_two_ground_truth():
     prompt = renderer._prompt("lifestyle", "pet portrait")
-    assert "ground-truth artwork content" in prompt
-    assert "do not copy, reinterpret" in prompt
-    assert "replace only the visible art content" in prompt
-
-
-def test_card_prompts_keep_listing_artwork_as_image_two_and_ban_ai_text():
-    for mode in ("before_after_card", "information_card"):
-        prompt = renderer._prompt(mode, "topic=house portrait; style_fingerprint=abc; slot=15")
-        assert "Image 2" in prompt
-        assert "exact approved wording will be overlaid deterministically later" in prompt or "do not add" in prompt.lower()
-        assert "marketing text" in prompt
-        assert "blank poster" in prompt
-        assert "oversized empty panels" in prompt or "extra panels" in prompt
+    assert "second asset as the exact artwork target" in prompt
+    assert "preserve the room" in prompt
 
 
 def test_command_enables_image_generation(tmp_path):
@@ -119,3 +154,12 @@ def test_render_returns_one_mocked_image(tmp_path, monkeypatch):
     assert response.content == PNG + b"output"
     assert response.headers["x-renderer"] == "codex-local"
     assert response.headers["x-renderer-version"] == renderer.APP_VERSION
+    assert response.headers["x-render-request-sha256"]
+
+
+def test_duplicate_request_hash_is_fail_closed():
+    request = renderer.RenderRequest(mode="orientation", input_urls=["https://example.com/same.jpg"])
+    digest = renderer._request_hash(request)
+    renderer._claim_request(digest)
+    with pytest.raises(ValueError, match="duplicate_request_hash"):
+        renderer._claim_request(digest)

@@ -14,47 +14,80 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.responses import Response
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.2.0"
+CONTRACT_VERSION = "luxlm-render-contract-v2"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
-ALLOWED_MODES = {
-    "minimal_frame",
-    "lifestyle",
-    "orientation",
-    "before_after_card",
-    "information_card",
-}
-EXPECTED_INPUTS = {
-    "minimal_frame": 1,
-    "lifestyle": 2,
-    "orientation": 1,
-    "before_after_card": 2,
-    "information_card": 2,
-}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
+MODE_CONTRACTS: dict[str, dict[str, Any]] = {
+    "minimal_frame": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": False},
+    "lifestyle": {"expected_input_count": 2, "output_kind": "final_asset", "generated_text": False},
+    "orientation": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": False},
+    "before_after_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
+    "information_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
+    "decorative_asset": {"expected_input_count": None, "output_kind": "decorative_asset", "generated_text": False},
+}
+ALLOWED_MODES = set(MODE_CONTRACTS)
+EXPECTED_INPUTS = {key: value["expected_input_count"] for key, value in MODE_CONTRACTS.items() if value["expected_input_count"] is not None}
+STRICT_NO_TEXT = [
+    "text", "letters", "numbers", "signature", "logo", "watermark", "blank_caption_sheet",
+    "paper_mat", "marketing_panel", "empty_label_region",
+]
+
 _RENDER_LOCK = threading.BoundedSemaphore(1)
-_ASYNC_JOBS: dict[str, dict] = {}
+_ASYNC_JOBS: dict[str, dict[str, Any]] = {}
 _ASYNC_JOBS_LOCK = threading.Lock()
+_REQUEST_DIGESTS: dict[str, dict[str, Any]] = {}
+_REQUEST_DIGESTS_LOCK = threading.Lock()
 ASYNC_JOB_TTL_SECONDS = 3600
+REQUEST_DIGEST_TTL_SECONDS = 3600
 app = FastAPI(title="Etsy Codex Renderer", version=APP_VERSION)
+
+
+class AssetRole(BaseModel):
+    role: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=1, max_length=4000)
+    preservation: str = Field(default="reference_only", max_length=120)
+    exact_pixel_preservation: bool = False
+    transform_allowed: bool = True
+
+    @field_validator("role", "preservation")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        return " ".join(str(value).strip().split())
 
 
 class RenderRequest(BaseModel):
     mode: str
-    input_urls: list[str]
+    input_urls: list[str] = Field(default_factory=list)
     context: str = Field(default="", max_length=2000)
+    module: str = Field(default="", max_length=120)
+    template_family: str = Field(default="", max_length=160)
+    template_reference_url: str = Field(default="", max_length=4000)
+    layout_contract: dict[str, Any] = Field(default_factory=dict)
+    listing_assets: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
+    decorative_asset_requests: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
+    card_brief: dict[str, Any] = Field(default_factory=dict)
+    asset_roles: list[AssetRole] = Field(default_factory=list, max_length=8)
+    generation_instructions: dict[str, Any] = Field(default_factory=dict)
+    prohibited_elements: list[str] = Field(default_factory=list, max_length=40)
+    expected_input_count: int | None = Field(default=None, ge=0, le=8)
+    prompt_version: str = Field(default="luxlm-decorative-asset-v1", max_length=120)
 
     @field_validator("mode")
     @classmethod
     def validate_mode(cls, value: str) -> str:
-        normalized = value.strip().lower()
+        normalized = str(value).strip().lower()
         if normalized not in ALLOWED_MODES:
             raise ValueError("invalid_render_mode")
         return normalized
@@ -62,9 +95,43 @@ class RenderRequest(BaseModel):
     @field_validator("input_urls")
     @classmethod
     def validate_urls_shape(cls, value: list[str]) -> list[str]:
-        if not isinstance(value, list) or not value:
+        if not isinstance(value, list):
             raise ValueError("invalid_input_urls")
-        return value
+        return [str(item).strip() for item in value]
+
+    @field_validator("prohibited_elements")
+    @classmethod
+    def normalize_prohibited(cls, value: list[str]) -> list[str]:
+        return sorted({" ".join(str(item).strip().lower().split()) for item in value if str(item).strip()})
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "RenderRequest":
+        contract = MODE_CONTRACTS[self.mode]
+        if self.asset_roles:
+            role_urls = [role.url.strip() for role in self.asset_roles]
+            if self.input_urls and self.input_urls != role_urls:
+                raise ValueError("asset_roles_must_match_input_urls")
+            self.input_urls = role_urls
+        expected = self.expected_input_count
+        if expected is None:
+            expected = contract["expected_input_count"]
+        if self.mode == "decorative_asset":
+            if expected is None:
+                expected = len(self.input_urls)
+            if expected < 1 or expected > 8:
+                raise ValueError("decorative_asset_requires_exact_input_count")
+            required = set(STRICT_NO_TEXT)
+            if not required.issubset(set(self.prohibited_elements)):
+                raise ValueError("decorative_asset_requires_strict_no_text_prohibitions")
+            if not self.asset_roles:
+                raise ValueError("decorative_asset_requires_asset_roles")
+        if expected is not None and len(self.input_urls) != expected:
+            raise ValueError("invalid_input_count")
+        if self.asset_roles and len({role.role for role in self.asset_roles}) != len(self.asset_roles):
+            raise ValueError("duplicate_asset_role")
+        if self.template_reference_url and not self.template_reference_url.startswith("https://"):
+            raise ValueError("invalid_template_reference_url")
+        return self
 
 
 def _token() -> str:
@@ -93,14 +160,7 @@ def _public_addresses(hostname: str) -> list[str]:
         raise ValueError("input_host_unresolvable")
     for raw in addresses:
         address = ipaddress.ip_address(raw)
-        if (
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-        ):
+        if address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified:
             raise ValueError("input_url_not_public")
     return addresses
 
@@ -108,13 +168,7 @@ def _public_addresses(hostname: str) -> list[str]:
 def _validate_public_https_url(value: str) -> str:
     url = str(value or "").strip()
     parsed = urlparse(url)
-    if (
-        parsed.scheme.lower() != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-    ):
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise ValueError("invalid_input_url")
     hostname = parsed.hostname.rstrip(".").lower()
     if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
@@ -135,10 +189,7 @@ def _sniff_image(data: bytes) -> tuple[str, str]:
 
 def _download_image(url: str, target_stem: Path) -> Path:
     current = _validate_public_https_url(url)
-    with httpx.Client(timeout=60, follow_redirects=False, headers={
-        "User-Agent": "Etsy-Codex-Renderer/1.0",
-        "Accept": "image/png,image/jpeg,image/webp",
-    }) as client:
+    with httpx.Client(timeout=60, follow_redirects=False, headers={"User-Agent": "Etsy-Codex-Renderer/1.2", "Accept": "image/png,image/jpeg,image/webp"}) as client:
         for _ in range(4):
             response = client.get(current)
             if response.status_code in {301, 302, 303, 307, 308}:
@@ -158,62 +209,60 @@ def _download_image(url: str, target_stem: Path) -> Path:
     raise ValueError("too_many_input_redirects")
 
 
-def _prompt(mode: str, context: str) -> str:
+def _role_contract(request: RenderRequest) -> dict[str, Any]:
+    contract = MODE_CONTRACTS[request.mode]
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "mode": request.mode,
+        "module": request.module,
+        "template_family": request.template_family,
+        "expected_input_count": request.expected_input_count if request.expected_input_count is not None else contract["expected_input_count"],
+        "asset_roles": [role.model_dump(mode="json") for role in request.asset_roles],
+        "output_kind": contract["output_kind"],
+        "generated_text": False,
+        "prohibited_elements": sorted(set(STRICT_NO_TEXT + request.prohibited_elements)),
+        "layout_contract_hash": hashlib.sha256(json.dumps(request.layout_contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+    }
+
+
+def _prompt(request: RenderRequest | str, context: str = "") -> str:
+    if isinstance(request, str):
+        legacy_mode = request
+        request = RenderRequest(mode=legacy_mode, input_urls=["https://example.com/input.jpg"] * EXPECTED_INPUTS[legacy_mode], context=context)
+    role_contract = _role_contract(request)
+    role_lines = []
+    for index, role in enumerate(request.asset_roles, 1):
+        preservation = "EXACT PIXEL PRESERVATION REQUIRED" if role.exact_pixel_preservation else role.preservation
+        transform = "no transform" if not role.transform_allowed else "transform only as contract permits"
+        role_lines.append(f"Asset {index}: role={role.role}; preservation={preservation}; {transform}.")
     common = (
-        "Use the built-in image_gen/image_generation tool exactly once. "
-        "Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, "
-        "placeholder art, or a programmatic drawing. Generate exactly one polished raster image. "
-        "After generation succeeds, use only a simple filesystem copy to place the exact generated raster "
-        "file at ./rendered-output.png in the current workspace. Do not redraw, convert, or re-encode it. "
-        "Do not finish until ./rendered-output.png exists. "
-        "Do not add captions, logos, watermarks, signatures, prices, badges, or marketing text."
+        "Use the built-in image_gen/image_generation tool exactly once. Do not call an external image API, do not run "
+        "image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly "
+        "one polished raster image, then copy the exact generated raster to ./rendered-output.png without redrawing or "
+        "re-encoding it. This is a decorative visual asset, not the final typography compositor. Never generate words, "
+        "letters, numbers, pseudo-lettering, signatures, logos, watermarks, blank caption sheets, paper mats, empty "
+        "label regions, marketing panels, generic information panels, prices, badges, or invented claims. Do not copy competitor branding, exact "
+        "coordinates, distinctive protected elements, or source-image text. Preserve any role marked exact pixel "
+        "preservation; the final system may composite that raster deterministically afterward."
     )
     instructions = {
-        "minimal_frame": (
-            "Image 1 is the exact finished artwork. Create a premium minimal-frame Etsy hero mockup. "
-            "Use one simple neutral frame and a clean restrained background. The artwork must occupy about "
-            "75 to 85 percent of the canvas so it remains readable as a small listing thumbnail. Preserve the "
-            "artwork's subjects, colours, linework, texture, proportions, composition, and intentional text. "
-            "Do not invent a different artwork and do not add additional frames."
-        ),
-        "lifestyle": (
-            "Image 1 is the original interior photograph and Image 2 is the exact finished artwork to be inserted. "
-            "Image 2 is the ground-truth artwork content: place that artwork, with its subject, colors, composition, "
-            "and any intentional approved text preserved, into the clearest existing framed-art or wall-display area. "
-            "The art already visible in Image 1 is only a physical placement target; do not copy, reinterpret, or "
-            "replace Image 2 with it. If the target frame already contains art, replace only the visible art content "
-            "inside that frame with Image 2 while preserving the frame, mat, room, furniture, camera angle, lighting, "
-            "shadows, and reflections. Do not redesign the room or artwork and do not add extra frames."
-        ),
-        "orientation": (
-            "Image 1 is the exact finished artwork. Create one clean ecommerce presentation that clearly shows "
-            "its full portrait or landscape composition at a large readable size. Use a neutral studio background "
-            "and one restrained print or frame presentation. Do not crop important outer details."
-        ),
-        "before_after_card": (
-            "Image 1 is the exact source photograph for this listing. Image 2 is the exact finished listing artwork "
-            "created from the same subject and is the primary visual/style anchor. Create one polished, listing-specific "
-            "before-and-after ecommerce composition: show Image 1 as the before/source view and create the after view "
-            "as a faithful visual transformation of Image 1 using Image 2's medium, palette, texture, and line treatment. "
-            "Image 2 is a style anchor only and must not be reproduced as a separate panel or copied as content. Preserve "
-            "the source subject; do not invent a different subject. Never copy Image 2's words, names, dates, signatures, "
-            "logos, watermarks, caption area, paper/mat edge, or border. Do not add extra panels, frames, captions, "
-            "labels, blank poster areas, infographic cards, or marketing text. This is only the visual before/after "
-            "composition; exact approved labels will be overlaid deterministically later."
-        ),
-        "information_card": (
-            "Image 1 is a relevant source, mockup, or supporting context image for this exact listing. Image 2 is the "
-            "exact finished listing artwork and the primary visual/style anchor. Create one polished, listing-specific "
-            "editorial supporting visual using Image 1 as the topic/context and Image 2 only for the artwork's "
-            "medium, palette, texture, and line treatment. Do not reproduce Image 2 as a separate panel or copy its "
-            "writing, names, dates, signatures, logos, watermarks, caption area, paper/mat edge, or border. Keep the "
-            "listing subject recognizable and do not invent product claims or add captions, labels, logos, signatures, "
-            "watermarks, badges, prices, marketing text, blank poster areas, oversized empty panels, or generic "
-            "infographic-card layouts; exact approved wording will be overlaid deterministically later."
-        ),
+        "minimal_frame": "Create a restrained ecommerce frame presentation around the exact finished artwork.",
+        "lifestyle": "Use the room as the physical context and the second asset as the exact artwork target; preserve the room and do not redraw the artwork.",
+        "orientation": "Create a clean presentation of the exact complete artwork without cropping important architecture or subject content.",
+        "before_after_card": "Create a visual-only before/after supporting asset; do not add text or a generic information panel.",
+        "information_card": "Create a visual-only supporting asset; do not add text or a generic information panel. Final composition and wording are deterministic outside this service.",
+        "decorative_asset": f"Create only the requested decorative visual treatment for module {request.module or 'unspecified'}; obey the supplied layout and asset roles.",
     }
-    suffix = f" Product context: {' '.join(context.split())[:500]}." if context.strip() else ""
-    return f"{common}\n\n{instructions[mode]}{suffix}\n\nReturn only a brief confirmation after generating the image."
+    compact_context = " ".join((request.context or "").split())[:700]
+    return "\n\n".join([
+        common,
+        instructions[request.mode],
+        "STRUCTURED INPUT CONTRACT:\n" + json.dumps(role_contract, ensure_ascii=True, sort_keys=True),
+        "ROLE INSTRUCTIONS:\n" + ("\n".join(role_lines) or "No role lines supplied."),
+        "GENERATION INSTRUCTIONS:\n" + json.dumps(request.generation_instructions, ensure_ascii=True, sort_keys=True),
+        f"Listing-specific context: {compact_context}",
+        "Return only a brief confirmation after generating the image.",
+    ])
 
 
 def _codex_home() -> Path:
@@ -252,17 +301,14 @@ def _new_outputs(workspace: Path, before: dict[str, tuple[int, int]], inputs: li
 
 
 def _codex_command(workspace: Path, inputs: list[Path]) -> list[str]:
-    command = [
-        "codex", "exec", "--skip-git-repo-check", "--sandbox", "danger-full-access",
-        "--ephemeral", "--enable", "image_generation", "-C", str(workspace), "--json",
-    ]
+    command = ["codex", "exec", "--skip-git-repo-check", "--sandbox", "danger-full-access", "--ephemeral", "--enable", "image_generation", "-C", str(workspace), "--json"]
     for path in inputs:
         command.extend(["-i", str(path)])
     command.append("-")
     return command
 
 
-def readiness() -> dict:
+def readiness() -> dict[str, Any]:
     binary = shutil.which("codex")
     version = ""
     authenticated = False
@@ -272,9 +318,7 @@ def readiness() -> dict:
             version_result = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=8)
             version = (version_result.stdout or version_result.stderr).strip()
             login = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=8)
-            authenticated = login.returncode == 0 and "not logged in" not in (
-                (login.stdout or "") + (login.stderr or "")
-            ).lower()
+            authenticated = login.returncode == 0 and "not logged in" not in ((login.stdout or "") + (login.stderr or "")).lower()
             features = subprocess.run(["codex", "features", "list"], capture_output=True, text=True, timeout=8)
             for line in (features.stdout or "").splitlines():
                 parts = line.split()
@@ -285,24 +329,42 @@ def readiness() -> dict:
             pass
     return {
         "ready": bool(binary and authenticated and image_generation and _token()),
-        "binary": bool(binary),
-        "version": version,
-        "authenticated": authenticated,
-        "image_generation": image_generation,
-        "token_configured": bool(_token()),
-        "renderer": "codex-local",
-        "app_version": APP_VERSION,
+        "binary": bool(binary), "version": version, "authenticated": authenticated,
+        "image_generation": image_generation, "token_configured": bool(_token()),
+        "renderer": "codex-local", "app_version": APP_VERSION, "contract_version": CONTRACT_VERSION,
     }
 
 
+def _request_hash(request: RenderRequest) -> str:
+    payload = request.model_dump(mode="json")
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _claim_request(request_hash: str) -> None:
+    now = time.time()
+    with _REQUEST_DIGESTS_LOCK:
+        for digest, row in list(_REQUEST_DIGESTS.items()):
+            if now - float(row.get("created_at") or 0) > REQUEST_DIGEST_TTL_SECONDS:
+                _REQUEST_DIGESTS.pop(digest, None)
+        if request_hash in _REQUEST_DIGESTS:
+            raise ValueError("duplicate_request_hash")
+        _REQUEST_DIGESTS[request_hash] = {"created_at": now, "status": "running"}
+
+
+def _release_failed_request(request_hash: str) -> None:
+    with _REQUEST_DIGESTS_LOCK:
+        _REQUEST_DIGESTS.pop(request_hash, None)
+
+
 def _render(request: RenderRequest) -> tuple[bytes, str, str]:
-    expected = EXPECTED_INPUTS[request.mode]
-    if len(request.input_urls) != expected:
-        raise ValueError("invalid_input_count")
     urls = [_validate_public_https_url(url) for url in request.input_urls]
+    request_hash = _request_hash(request)
+    _claim_request(request_hash)
     if not readiness()["ready"]:
+        _release_failed_request(request_hash)
         raise RuntimeError("renderer_not_ready")
     if not _RENDER_LOCK.acquire(timeout=5):
+        _release_failed_request(request_hash)
         raise RuntimeError("renderer_busy")
     outputs: list[Path] = []
     try:
@@ -313,10 +375,7 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
             inputs = [_download_image(url, workspace / f"input-{index}") for index, url in enumerate(urls, 1)]
             before = _snapshot(workspace)
             timeout = max(60, min(int(os.environ.get("CODEX_RENDER_TIMEOUT_SECONDS", "900")), 1800))
-            result = subprocess.run(
-                _codex_command(workspace, inputs), cwd=workspace, input=_prompt(request.mode, request.context),
-                text=True, capture_output=True, timeout=timeout, check=False,
-            )
+            result = subprocess.run(_codex_command(workspace, inputs), cwd=workspace, input=_prompt(request), text=True, capture_output=True, timeout=timeout, check=False)
             outputs = _new_outputs(workspace, before, inputs)
             if result.returncode != 0:
                 combined = ((result.stderr or "") + "\n" + (result.stdout or "")).lower()
@@ -333,28 +392,17 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                 mime, _ = _sniff_image(data)
                 unique[hashlib.sha256(data).hexdigest()] = (data, mime)
             if not unique:
-                workspace_files = []
-                for candidate in workspace.rglob("*"):
-                    if candidate.is_file():
-                        try:
-                            workspace_files.append({
-                                "path": str(candidate.relative_to(workspace)),
-                                "bytes": candidate.stat().st_size,
-                            })
-                        except OSError:
-                            pass
-                print(json.dumps({
-                    "event": "codex_render_output_missing",
-                    "returncode": result.returncode,
-                    "stdout_tail": (result.stdout or "")[-12000:],
-                    "stderr_tail": (result.stderr or "")[-6000:],
-                    "workspace_files": workspace_files[:50],
-                }, ensure_ascii=True), flush=True)
                 raise RuntimeError("output_missing")
             if len(unique) != 1:
                 raise RuntimeError("output_ambiguous")
             digest, (data, mime) = next(iter(unique.items()))
+            with _REQUEST_DIGESTS_LOCK:
+                if request_hash in _REQUEST_DIGESTS:
+                    _REQUEST_DIGESTS[request_hash].update({"status": "succeeded", "output_sha256": digest})
             return data, mime, digest
+    except Exception:
+        _release_failed_request(request_hash)
+        raise
     finally:
         generated_root = (_codex_home() / "generated_images").resolve()
         for path in outputs:
@@ -384,81 +432,54 @@ def _run_async_job(job_id: str, request: RenderRequest) -> None:
         data, mime, digest = _render(request)
         with _ASYNC_JOBS_LOCK:
             if job_id in _ASYNC_JOBS:
-                _ASYNC_JOBS[job_id].update({
-                    "status": "succeeded",
-                    "data": data,
-                    "mime": mime,
-                    "digest": digest,
-                })
+                _ASYNC_JOBS[job_id].update({"status": "succeeded", "data": data, "mime": mime, "digest": digest})
     except Exception as exc:
         with _ASYNC_JOBS_LOCK:
             if job_id in _ASYNC_JOBS:
                 _ASYNC_JOBS[job_id].update({"status": "failed", "error": str(exc)[:200]})
 
 
-def _async_job_response(job_id: str, job: dict):
+def _async_job_response(job_id: str, job: dict[str, Any]):
     status = str(job.get("status") or "queued")
     if status in {"queued", "running"}:
-        return JSONResponse({"job_id": job_id, "status": status}, status_code=202)
+        return JSONResponse({"job_id": job_id, "status": status, "contract_version": CONTRACT_VERSION}, status_code=202)
     if status == "failed":
-        raise HTTPException(status_code=503, detail=str(job.get("error") or "codex_render_failed"))
+        detail = str(job.get("error") or "codex_render_failed")
+        status_code = 409 if detail == "duplicate_request_hash" else 503
+        raise HTTPException(status_code=status_code, detail=detail)
     data = bytes(job.get("data") or b"")
-    return Response(
-        content=data,
-        media_type=str(job.get("mime") or "image/png"),
-        headers={
-            "Cache-Control": "no-store",
-            "X-Renderer": "codex-local",
-            "X-Renderer-Version": APP_VERSION,
-            "X-Render-Mode": str(job.get("mode") or ""),
-            "X-Image-Sha256": str(job.get("digest") or ""),
-        },
-    )
+    return Response(content=data, media_type=str(job.get("mime") or "image/png"), headers={
+        "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
+        "X-Render-Mode": str(job.get("mode") or ""), "X-Image-Sha256": str(job.get("digest") or ""),
+        "X-Render-Request-Sha256": str(job.get("request_hash") or ""),
+    })
 
 
 @app.get("/health")
-def health() -> dict:
+def health() -> dict[str, Any]:
     return readiness()
 
 
 @app.post("/render")
-async def render(
-    request: RenderRequest,
-    authorization: str | None = Header(default=None),
-    x_renderer_token: str | None = Header(default=None),
-) -> Response:
+async def render(request: RenderRequest, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> Response:
     _require_auth(authorization, x_renderer_token)
     try:
         data, mime, digest = await asyncio.to_thread(_render, request)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        code = str(exc)
+        raise HTTPException(status_code=409 if code == "duplicate_request_hash" else 400, detail=code) from exc
     except RuntimeError as exc:
         code = str(exc)
-        status = 429 if code == "renderer_busy" else 503
-        raise HTTPException(status_code=status, detail=code) from exc
-    return Response(
-        content=data,
-        media_type=mime,
-        headers={
-            "Cache-Control": "no-store",
-            "X-Renderer": "codex-local",
-            "X-Renderer-Version": APP_VERSION,
-            "X-Render-Mode": request.mode,
-            "X-Image-Sha256": digest,
-        },
-    )
+        raise HTTPException(status_code=429 if code == "renderer_busy" else 503, detail=code) from exc
+    return Response(content=data, media_type=mime, headers={
+        "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
+        "X-Render-Mode": request.mode, "X-Image-Sha256": digest, "X-Render-Request-Sha256": _request_hash(request),
+    })
 
 
 @app.post("/render-async", status_code=202)
-def render_async(
-    request: RenderRequest,
-    authorization: str | None = Header(default=None),
-    x_renderer_token: str | None = Header(default=None),
-) -> JSONResponse:
+def render_async(request: RenderRequest, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> JSONResponse:
     _require_auth(authorization, x_renderer_token)
-    expected = EXPECTED_INPUTS[request.mode]
-    if len(request.input_urls) != expected:
-        raise HTTPException(status_code=400, detail="invalid_input_count")
     try:
         for url in request.input_urls:
             _validate_public_https_url(url)
@@ -468,22 +489,15 @@ def render_async(
         raise HTTPException(status_code=503, detail="renderer_not_ready")
     _prune_async_jobs()
     job_id = uuid.uuid4().hex
+    request_hash = _request_hash(request)
     with _ASYNC_JOBS_LOCK:
-        _ASYNC_JOBS[job_id] = {
-            "status": "queued",
-            "created_at": time.time(),
-            "mode": request.mode,
-        }
+        _ASYNC_JOBS[job_id] = {"status": "queued", "created_at": time.time(), "mode": request.mode, "request_hash": request_hash}
     threading.Thread(target=_run_async_job, args=(job_id, request), daemon=True).start()
-    return JSONResponse({"job_id": job_id, "status": "queued"}, status_code=202)
+    return JSONResponse({"job_id": job_id, "status": "queued", "request_hash": request_hash, "contract_version": CONTRACT_VERSION}, status_code=202)
 
 
 @app.get("/render-async/{job_id}")
-def render_async_status(
-    job_id: str,
-    authorization: str | None = Header(default=None),
-    x_renderer_token: str | None = Header(default=None),
-):
+def render_async_status(job_id: str, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)):
     _require_auth(authorization, x_renderer_token)
     _prune_async_jobs()
     with _ASYNC_JOBS_LOCK:
