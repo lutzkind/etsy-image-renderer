@@ -1,18 +1,16 @@
 # etsy-codex-renderer
 
-Dedicated private local-Codex image renderer for the Windmill Etsy automation
-pipeline. The service is an isolated visual-asset boundary: it does not own
-listing state or final customer-facing typography.
+Private local Codex image renderer for the Windmill Etsy automation pipeline. Codex is the sole image renderer and owns raster generation only. Windmill owns state, QA, approval, deterministic compositing, and final listing decisions.
 
-`POST /render` and `/render-async` accept the versioned
-`luxlm-render-contract-v2`. Legacy modes remain available with their exact
-input counts. New decorative requests must provide `asset_roles`, an exact
-`expected_input_count`, a module/template identity, and strict no-text
-prohibitions. Exact artwork rasters can be marked
-`exact_pixel_preservation=true`; deterministic Windmill compositors remain
-responsible for final placement and all exact wording.
+`POST /render` and `POST /render-async` accept the versioned `luxlm-render-contract-v2`.
 
-Example request shape:
+## Modes
+
+- `mockup`: existing mockup generation mode, with its established input count and contract.
+- `decorative_asset`: existing decorative generation mode. It remains strictly no-text: no letters, numbers, signatures, logos, watermarks, captions, labels, or empty text-bearing panels. New requests must provide `asset_roles`, an exact `expected_input_count`, module/template identity, and explicit prohibitions. Use `exact_pixel_preservation=true` when the supplied artwork raster must remain exact.
+- `designed_card`: generates a complete premium card. All visible copy must be taken verbatim from the approved `card_brief`; the renderer must not invent, rewrite, translate, or add text. `template_reference_url` is inspiration-only, is passed separately from the `card_brief`, and is not an authority for copy.
+
+Example decorative request:
 
 ```json
 {
@@ -25,14 +23,16 @@ Example request shape:
     {"role": "style_anchor", "url": "https://...", "preservation": "style_only"}
   ],
   "generation_instructions": {"decorative_density": "low"},
-  "prohibited_elements": [
-    "text", "letters", "numbers", "signature", "logo", "watermark",
-    "blank_caption_sheet", "paper_mat", "marketing_panel", "empty_label_region"
-  ],
+  "prohibited_elements": ["text", "letters", "numbers", "signature", "logo", "watermark"],
   "prompt_version": "luxlm-decorative-asset-v1"
 }
 ```
 
-Every successful response includes the renderer version, contract version,
-request hash, and output SHA-256. Identical requests are rejected for the
-bounded cache window so a retry cannot silently pay for an identical render.
+## Async behavior
+
+`POST /render-async` returns a job identifier. Duplicate requests with the same normalized request return the same job rather than creating another render.
+
+- Status JSON: `GET /render-async/{job_id}`
+- Result binary: `GET /render-async/{job_id}/result`
+
+Successful render responses include the renderer version, contract version, request hash, and output SHA-256.
