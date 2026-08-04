@@ -9,6 +9,7 @@ import os
 import shutil
 import socket
 import subprocess
+import queue
 import tempfile
 import threading
 import time
@@ -23,7 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 CONTRACT_VERSION = "luxlm-render-contract-v2"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
@@ -53,6 +54,11 @@ _REQUEST_DIGESTS: dict[str, dict[str, Any]] = {}
 _REQUEST_DIGESTS_LOCK = threading.Lock()
 ASYNC_JOB_TTL_SECONDS = 3600
 REQUEST_DIGEST_TTL_SECONDS = 3600
+_ASYNC_QUEUE: queue.Queue[str] = queue.Queue()
+_ASYNC_QUEUE_IDS: set[str] = set()
+_ASYNC_WORKER_LOCK = threading.Lock()
+_ASYNC_WORKER_STARTED = False
+_ASYNC_STATE_RESTORED = False
 app = FastAPI(title="Etsy Codex Renderer", version=APP_VERSION)
 
 
@@ -416,7 +422,11 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
         if not async_context:
             _release_failed_request(request_hash)
         raise RuntimeError("renderer_not_ready")
-    acquired = _RENDER_LOCK.acquire(timeout=5)
+    if async_context:
+        _RENDER_LOCK.acquire()
+        acquired = True
+    else:
+        acquired = _RENDER_LOCK.acquire(timeout=5)
     if not acquired:
         if not async_context:
             _release_failed_request(request_hash)
