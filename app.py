@@ -752,12 +752,15 @@ def render_async(request: RenderRequest, authorization: str | None = Header(defa
     request_hash = _request_hash(request)
     with _ASYNC_JOBS_LOCK:
         existing_id = _ASYNC_HASH_INDEX.get(request_hash)
-        if existing_id:
-            existing = _load_async_job(existing_id)
-            if existing and existing.get("status") in {"queued", "running", "succeeded"}:
-                return _async_job_response(existing_id, existing)
-            _ASYNC_HASH_INDEX.pop(request_hash, None)
-        job_id = uuid.uuid4().hex
+    if existing_id:
+        existing = _load_async_job(existing_id)
+        if existing and existing.get("status") in {"queued", "running", "succeeded"}:
+            return _async_job_response(existing_id, existing)
+        with _ASYNC_JOBS_LOCK:
+            if _ASYNC_HASH_INDEX.get(request_hash) == existing_id:
+                _ASYNC_HASH_INDEX.pop(request_hash, None)
+    job_id = uuid.uuid4().hex
+    with _ASYNC_JOBS_LOCK:
         _ASYNC_HASH_INDEX[request_hash] = job_id
         _ASYNC_JOBS[job_id] = {
             "status": "queued",
