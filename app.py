@@ -615,6 +615,7 @@ def _restore_async_state() -> None:
 
 
 def _prune_async_jobs() -> None:
+    _restore_async_state()
     cutoff = time.time() - ASYNC_JOB_TTL_SECONDS
     with _ASYNC_JOBS_LOCK:
         for job_id, job in list(_ASYNC_JOBS.items()):
@@ -632,6 +633,11 @@ def _prune_async_jobs() -> None:
                 request_hash = str(job.get("request_hash") or "")
                 if request_hash and _ASYNC_HASH_INDEX.get(request_hash) == job_id:
                     _ASYNC_HASH_INDEX.pop(request_hash, None)
+                try:
+                    _async_job_meta_path(job_id).unlink(missing_ok=True)
+                    _async_job_result_path(job_id).unlink(missing_ok=True)
+                except OSError:
+                    pass
         for request_hash, job_id in list(_ASYNC_HASH_INDEX.items()):
             if job_id not in _ASYNC_JOBS:
                 _ASYNC_HASH_INDEX.pop(request_hash, None)
