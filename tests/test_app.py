@@ -19,10 +19,14 @@ def clear_state():
     renderer._REQUEST_DIGESTS.clear()
     renderer._ASYNC_JOBS.clear()
     renderer._ASYNC_HASH_INDEX.clear()
+    renderer._ASYNC_QUEUE_IDS.clear()
+    renderer._ASYNC_STATE_RESTORED = False
     yield
     renderer._REQUEST_DIGESTS.clear()
     renderer._ASYNC_JOBS.clear()
     renderer._ASYNC_HASH_INDEX.clear()
+    renderer._ASYNC_QUEUE_IDS.clear()
+    renderer._ASYNC_STATE_RESTORED = False
 
 
 def designed_payload(**overrides):
