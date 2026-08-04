@@ -709,7 +709,13 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return readiness()
+    _restore_async_state()
+    payload = readiness()
+    with _ASYNC_JOBS_LOCK:
+        payload["queued_jobs"] = sum(1 for job in _ASYNC_JOBS.values() if job.get("status") == "queued")
+        payload["running_jobs"] = sum(1 for job in _ASYNC_JOBS.values() if job.get("status") == "running")
+    payload["persistent_queue"] = True
+    return payload
 
 
 @app.post("/render")
@@ -741,19 +747,27 @@ def render_async(request: RenderRequest, authorization: str | None = Header(defa
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not readiness()["ready"]:
         raise HTTPException(status_code=503, detail="renderer_not_ready")
+    _restore_async_state()
     _prune_async_jobs()
     request_hash = _request_hash(request)
     with _ASYNC_JOBS_LOCK:
         existing_id = _ASYNC_HASH_INDEX.get(request_hash)
         if existing_id:
-            existing = _ASYNC_JOBS.get(existing_id)
+            existing = _load_async_job(existing_id)
             if existing and existing.get("status") in {"queued", "running", "succeeded"}:
-                return _async_job_response(existing_id, dict(existing))
+                return _async_job_response(existing_id, existing)
             _ASYNC_HASH_INDEX.pop(request_hash, None)
         job_id = uuid.uuid4().hex
         _ASYNC_HASH_INDEX[request_hash] = job_id
-        _ASYNC_JOBS[job_id] = {"status": "queued", "created_at": time.time(), "mode": request.mode, "request_hash": request_hash}
-    threading.Thread(target=_run_async_job, args=(job_id, request), daemon=True).start()
+        _ASYNC_JOBS[job_id] = {
+            "status": "queued",
+            "created_at": time.time(),
+            "mode": request.mode,
+            "request_hash": request_hash,
+            "request": request.model_dump(mode="json"),
+        }
+        _persist_async_job(job_id, _ASYNC_JOBS[job_id])
+    _enqueue_async_job(job_id)
     return JSONResponse({"job_id": job_id, "status": "queued", "request_hash": request_hash, "contract_version": CONTRACT_VERSION}, status_code=202)
 
 
@@ -761,8 +775,7 @@ def render_async(request: RenderRequest, authorization: str | None = Header(defa
 def render_async_status(job_id: str, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> JSONResponse:
     _require_auth(authorization, x_renderer_token)
     _prune_async_jobs()
-    with _ASYNC_JOBS_LOCK:
-        job = dict(_ASYNC_JOBS.get(str(job_id)) or {})
+    job = _load_async_job(str(job_id))
     if not job:
         raise HTTPException(status_code=404, detail="render_job_not_found")
     return _async_job_response(str(job_id), job)
@@ -772,8 +785,7 @@ def render_async_status(job_id: str, authorization: str | None = Header(default=
 def render_async_result(job_id: str, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> Response:
     _require_auth(authorization, x_renderer_token)
     _prune_async_jobs()
-    with _ASYNC_JOBS_LOCK:
-        job = dict(_ASYNC_JOBS.get(str(job_id)) or {})
+    job = _load_async_job(str(job_id))
     if not job:
         raise HTTPException(status_code=404, detail="render_job_not_found")
     status = str(job.get("status") or "queued")
@@ -781,7 +793,11 @@ def render_async_result(job_id: str, authorization: str | None = Header(default=
         raise HTTPException(status_code=202, detail="render_job_not_ready")
     if status == "failed":
         raise HTTPException(status_code=409, detail=str(job.get("error") or "codex_render_failed"))
-    return Response(content=bytes(job.get("data") or b""), media_type=str(job.get("mime") or "image/png"), headers={
+    try:
+        data = _load_async_result(str(job_id), job)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=410, detail="render_result_missing") from exc
+    return Response(content=data, media_type=str(job.get("mime") or "image/png"), headers={
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Image-Sha256": str(job.get("output_sha256") or job.get("digest") or ""),
         "X-Render-Request-Sha256": str(job.get("request_hash") or ""),
