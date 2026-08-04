@@ -6,19 +6,44 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 import app as renderer
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"test"
+AUTH = {"Authorization": "Bearer secret"}
 
 
 @pytest.fixture(autouse=True)
-def clear_request_cache():
+def clear_state():
     renderer._REQUEST_DIGESTS.clear()
     renderer._ASYNC_JOBS.clear()
+    renderer._ASYNC_HASH_INDEX.clear()
     yield
     renderer._REQUEST_DIGESTS.clear()
     renderer._ASYNC_JOBS.clear()
+    renderer._ASYNC_HASH_INDEX.clear()
+
+
+def designed_payload(**overrides):
+    payload = {
+        "mode": "designed_card",
+        "input_urls": ["https://example.com/listing.jpg", "https://example.com/detail.jpg"],
+        "expected_input_count": 2,
+        "module": "listing_gallery",
+        "template_family": "editorial_card_v1",
+        "asset_roles": [
+            {"role": "listing_photo", "url": "https://example.com/listing.jpg", "preservation": "subject_identity"},
+            {"role": "detail_photo", "url": "https://example.com/detail.jpg", "preservation": "exact_artwork"},
+        ],
+        "listing_assets": [{"role": "listing_photo"}, {"role": "detail_photo"}],
+        "layout_contract": {"aspect_ratio": "4:5", "headline_position": "top"},
+        "card_brief": {"headline": "Handmade for Every Day", "body": "Thoughtful details for your space.", "bullets": ["Solid wood", "Made to order"]},
+        "generation_instructions": {"palette": "warm natural", "finish": "editorial"},
+        "prohibited_elements": sorted(renderer.DESIGNED_CARD_PROHIBITIONS),
+    }
+    payload.update(overrides)
+    return payload
 
 
 def test_private_urls_are_rejected(monkeypatch):
@@ -27,49 +52,88 @@ def test_private_urls_are_rejected(monkeypatch):
         renderer._validate_public_https_url("https://example.test/a.png")
 
 
-def test_mode_contracts_keep_exact_legacy_counts_and_add_structured_decorator():
+def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
+    assert renderer.APP_VERSION == "1.3.0"
     assert renderer.EXPECTED_INPUTS == {
-        "minimal_frame": 1,
-        "lifestyle": 2,
-        "orientation": 1,
-        "before_after_card": 2,
-        "information_card": 2,
+        "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
+        "before_after_card": 2, "information_card": 2,
     }
     request = renderer.RenderRequest(
-        mode="decorative_asset",
-        expected_input_count=2,
+        mode="decorative_asset", expected_input_count=2,
         asset_roles=[
             {"role": "source_photo", "url": "https://example.com/source.jpg", "preservation": "subject_identity"},
             {"role": "style_anchor", "url": "https://example.com/art.jpg", "preservation": "style_only"},
-        ],
-        prohibited_elements=renderer.STRICT_NO_TEXT,
-        module="photo_guide",
+        ], prohibited_elements=renderer.STRICT_NO_TEXT, module="photo_guide",
         template_family="correct_wrong_photo_guide_v1",
     )
     assert request.input_urls == ["https://example.com/source.jpg", "https://example.com/art.jpg"]
     assert renderer._role_contract(request)["contract_version"] == renderer.CONTRACT_VERSION
 
 
-def test_decorative_request_rejects_missing_no_text_contract():
-    with pytest.raises(ValueError, match="strict_no_text"):
-        renderer.RenderRequest(
-            mode="decorative_asset",
-            expected_input_count=1,
-            asset_roles=[{"role": "source_photo", "url": "https://example.com/source.jpg"}],
-            prohibited_elements=["text"],
-        )
-
-
-def test_prompt_forbids_direct_api_fallback_and_generic_panels():
+def test_decorative_asset_remains_strict_no_text():
     request = renderer.RenderRequest(
-        mode="decorative_asset",
-        expected_input_count=2,
+        mode="decorative_asset", expected_input_count=1,
+        asset_roles=[{"role": "source", "url": "https://example.com/a.png"}],
+        prohibited_elements=renderer.STRICT_NO_TEXT,
+    )
+    contract = renderer._role_contract(request)
+    assert set(renderer.STRICT_NO_TEXT).issubset(set(contract["prohibited_elements"]))
+    assert "Never generate words" in renderer._prompt(request)
+
+
+def test_decorative_asset_rejects_missing_required_contract_parts():
+    with pytest.raises(ValueError, match="strict_no_text"):
+        renderer.RenderRequest(mode="decorative_asset", expected_input_count=1, asset_roles=[{"role": "source", "url": "https://example.com/a.png"}], prohibited_elements=["text"])
+    with pytest.raises(ValueError, match="asset_roles"):
+        renderer.RenderRequest(mode="decorative_asset", expected_input_count=1, input_urls=["https://example.com/a.png"], prohibited_elements=renderer.STRICT_NO_TEXT)
+    with pytest.raises(ValueError, match="exact_input_count"):
+        renderer.RenderRequest(mode="decorative_asset", expected_input_count=0, asset_roles=[{"role": "source", "url": "https://example.com/a.png"}], prohibited_elements=renderer.STRICT_NO_TEXT)
+
+
+@pytest.mark.parametrize(
+    ("field", "expected", "match"),
+    [
+        ("asset_roles", [], "designed_card_requires_asset_roles"),
+        ("listing_assets", [], "designed_card_requires_listing_assets"),
+        ("expected_input_count", 1, "designed_card_expected_input_count_mismatch"),
+        ("input_urls", ["https://example.com/listing.jpg"], "designed_card_input_count_mismatch"),
+        ("module", "", "designed_card_requires_module"),
+        ("template_family", "", "designed_card_requires_template_family"),
+        ("card_brief", {}, "designed_card_requires_headline"),
+        ("prohibited_elements", [], "designed_card_requires_prohibitions"),
+    ],
+)
+def test_designed_card_each_required_validation_failure(field, expected, match):
+    payload = designed_payload(**{field: expected})
+    with pytest.raises((ValueError, ValidationError), match=match):
+        renderer.RenderRequest.model_validate(payload)
+
+
+def test_designed_card_valid_contract():
+    request = renderer.RenderRequest.model_validate(designed_payload())
+    assert request.mode == "designed_card"
+    assert request.expected_input_count == 2
+    assert len(request.listing_assets) == 2
+    assert renderer._role_contract(request)["generated_text"] is True
+
+
+def test_designed_card_prompt_contains_exact_contract_and_rejects_generic_styling():
+    request = renderer.RenderRequest.model_validate(designed_payload(template_reference_url="https://example.com/template.png"))
+    prompt = renderer._prompt(request)
+    for text in ["Handmade for Every Day", "Thoughtful details for your space.", "Solid wood", "Made to order", "STRUCTURED INPUT CONTRACT", "layout_contract", "listing_assets", "GENERATION INSTRUCTIONS", "Use the built-in image_gen/image_generation tool exactly once", "inspiration only", "never copy it exactly"]:
+        assert text in prompt
+    for text in ["dashboard", "presentation slides", "ivory-panel", "Canva-like"]:
+        assert text.lower() in prompt.lower()
+    assert "generic information panels" in prompt
+
+
+def test_prompt_preserves_exact_pixel_and_forbids_direct_api_fallback():
+    request = renderer.RenderRequest(
+        mode="decorative_asset", expected_input_count=2,
         asset_roles=[
             {"role": "source_photo", "url": "https://example.com/source.jpg", "preservation": "subject_identity"},
             {"role": "listing_artwork", "url": "https://example.com/art.jpg", "exact_pixel_preservation": True, "transform_allowed": False},
-        ],
-        prohibited_elements=renderer.STRICT_NO_TEXT,
-        module="photo_guide",
+        ], prohibited_elements=renderer.STRICT_NO_TEXT, module="photo_guide",
         template_family="correct_wrong_photo_guide_v1",
     )
     prompt = renderer._prompt(request)
@@ -78,7 +142,40 @@ def test_prompt_forbids_direct_api_fallback_and_generic_panels():
     assert "EXACT PIXEL PRESERVATION REQUIRED" in prompt
     assert "blank caption sheets" in prompt
     assert "generic information panel" in prompt
-    assert "STRUCTURED INPUT CONTRACT" in prompt
+
+
+def test_template_reference_is_extra_command_image_without_changing_listing_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    monkeypatch.setenv("RENDER_DATA_DIR", str(tmp_path))
+    downloaded = []
+    command_seen = {}
+
+    def fake_download(url, target):
+        downloaded.append((url, target.name))
+        path = target.with_suffix(".png")
+        path.write_bytes(PNG)
+        return path
+
+    def fake_run(command, **kwargs):
+        command_seen["command"] = command
+        command_seen["prompt"] = kwargs["input"]
+        workspace = Path(command[command.index("-C") + 1])
+        output = workspace / "rendered-output.png"
+        output.write_bytes(PNG + b"out")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer.subprocess, "run", fake_run)
+    request = renderer.RenderRequest.model_validate(designed_payload(template_reference_url="https://example.com/template.png"))
+    data, mime, _ = renderer._render(request)
+    assert data == PNG + b"out"
+    assert mime == "image/png"
+    assert len(request.input_urls) == 2
+    assert len(downloaded) == 3
+    assert command_seen["command"].count("-i") == 3
+    assert "DESIGN REFERENCE ONLY" in command_seen["prompt"]
+    assert "inspiration-only" in command_seen["prompt"]
 
 
 def test_legacy_lifestyle_prompt_keeps_image_two_ground_truth():
@@ -97,64 +194,91 @@ def test_command_enables_image_generation(tmp_path):
 
 def test_render_endpoint_requires_auth(monkeypatch):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
-    client = TestClient(renderer.app)
-    response = client.post("/render", json={"mode": "orientation", "input_urls": ["https://example.com/a.png"]})
+    response = TestClient(renderer.app).post("/render", json={"mode": "orientation", "input_urls": ["https://example.com/a.png"]})
     assert response.status_code == 401
 
 
-def test_async_render_queue_returns_completed_image(monkeypatch):
+def test_sync_render_is_backward_compatible_and_duplicate_safe(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    request = {"mode": "orientation", "input_urls": ["https://example.com/a.png"]}
+
+    def fake_render(req):
+        renderer._claim_request(renderer._request_hash(req))
+        return PNG, "image/png", "digest"
+
+    monkeypatch.setattr(renderer, "_render", fake_render)
+    client = TestClient(renderer.app)
+    first = client.post("/render", headers=AUTH, json=request)
+    second = client.post("/render", headers=AUTH, json=request)
+    assert first.status_code == 200
+    assert first.content == PNG
+    assert first.headers["x-renderer-version"] == renderer.APP_VERSION
+    assert second.status_code == 409
+    assert second.json()["detail"] == "duplicate_request_hash"
+
+
+def test_async_repeated_request_reuses_job_while_queued_running_and_succeeded(monkeypatch):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
     monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
     monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
-    monkeypatch.setattr(renderer, "_render", lambda request: (PNG + b"async", "image/png", "digest"))
+    monkeypatch.setattr(renderer.threading, "Thread", lambda **kwargs: type("NoStart", (), {"start": lambda self: None})())
     client = TestClient(renderer.app)
-    response = client.post(
-        "/render-async",
-        headers={"Authorization": "Bearer secret"},
-        json={"mode": "orientation", "input_urls": ["https://example.com/a.png"]},
-    )
-    assert response.status_code == 202
-    job_id = response.json()["job_id"]
-    for _ in range(20):
-        result = client.get(f"/render-async/{job_id}", headers={"Authorization": "Bearer secret"})
-        if result.status_code == 200:
-            break
-    assert result.status_code == 200
-    assert result.content == PNG + b"async"
-    assert result.headers["x-image-sha256"] == "digest"
+    request = {"mode": "orientation", "input_urls": ["https://example.com/a.png"]}
+    first = client.post("/render-async", headers=AUTH, json=request)
+    job_id = first.json()["job_id"]
+    assert first.status_code == 202
+    assert client.post("/render-async", headers=AUTH, json=request).json()["job_id"] == job_id
+    renderer._ASYNC_JOBS[job_id]["status"] = "running"
+    assert client.post("/render-async", headers=AUTH, json=request).json()["job_id"] == job_id
+    renderer._ASYNC_JOBS[job_id].update({"status": "succeeded", "mime": "image/png", "output_sha256": "abc"})
+    completed = client.post("/render-async", headers=AUTH, json=request)
+    assert completed.json()["job_id"] == job_id
+    assert completed.json()["result_url"].endswith("/result")
 
 
-def test_render_returns_one_mocked_image(tmp_path, monkeypatch):
+def test_failed_async_job_releases_request_index_for_retry(monkeypatch):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    monkeypatch.setenv("RENDER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
     monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
-
-    def fake_download(url: str, target: Path) -> Path:
-        path = target.with_suffix(".png")
-        path.write_bytes(PNG)
-        return path
-
-    def fake_run(*args, **kwargs):
-        output = Path(renderer._codex_home()) / "generated_images" / "result.png"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(PNG + b"output")
-        return subprocess.CompletedProcess(["codex"], 0, stdout="ok", stderr="")
-
-    monkeypatch.setattr(renderer, "_download_image", fake_download)
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(renderer.threading, "Thread", lambda **kwargs: type("NoStart", (), {"start": lambda self: None})())
+    monkeypatch.setattr(renderer, "_render", lambda request: (_ for _ in ()).throw(RuntimeError("failed")))
     client = TestClient(renderer.app)
-    response = client.post(
-        "/render",
-        headers={"Authorization": "Bearer secret"},
-        json={"mode": "orientation", "input_urls": ["https://example.com/a.png"]},
-    )
+    request = renderer.RenderRequest(mode="orientation", input_urls=["https://example.com/a.png"])
+    first = client.post("/render-async", headers=AUTH, json=request.model_dump())
+    old_id = first.json()["job_id"]
+    renderer._run_async_job(old_id, request)
+    assert renderer._ASYNC_JOBS[old_id]["status"] == "failed"
+    retry = client.post("/render-async", headers=AUTH, json=request.model_dump())
+    assert retry.status_code == 202
+    assert retry.json()["job_id"] != old_id
+
+
+def test_completed_async_status_is_json_with_metadata_and_result_url(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    job_id = "completed"
+    renderer._ASYNC_JOBS[job_id] = {"status": "succeeded", "request_hash": "req", "mime": "image/png", "output_sha256": "sha", "data": PNG}
+    response = TestClient(renderer.app).get(f"/render-async/{job_id}", headers=AUTH)
     assert response.status_code == 200
-    assert response.content == PNG + b"output"
-    assert response.headers["x-renderer"] == "codex-local"
-    assert response.headers["x-renderer-version"] == renderer.APP_VERSION
-    assert response.headers["x-render-request-sha256"]
+    body = response.json()
+    assert body["result_url"] == f"/render-async/{job_id}/result"
+    assert body["mime"] == "image/png"
+    assert body["output_sha256"] == "sha"
+    assert body["app_version"] == renderer.APP_VERSION
+
+
+def test_async_result_binary_and_non_success_states(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    renderer._ASYNC_JOBS["queued"] = {"status": "queued"}
+    renderer._ASYNC_JOBS["failed"] = {"status": "failed", "error": "codex_render_failed"}
+    renderer._ASYNC_JOBS["done"] = {"status": "succeeded", "data": PNG, "mime": "image/png", "output_sha256": "sha", "request_hash": "req"}
+    client = TestClient(renderer.app)
+    assert client.get("/render-async/queued/result", headers=AUTH).status_code == 202
+    assert client.get("/render-async/failed/result", headers=AUTH).status_code == 409
+    result = client.get("/render-async/done/result", headers=AUTH)
+    assert result.status_code == 200
+    assert result.content == PNG
+    assert result.headers["x-image-sha256"] == "sha"
+    assert client.get("/render-async/missing/result", headers=AUTH).status_code == 404
 
 
 def test_duplicate_request_hash_is_fail_closed():
