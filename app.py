@@ -54,6 +54,11 @@ _REQUEST_DIGESTS: dict[str, dict[str, Any]] = {}
 _REQUEST_DIGESTS_LOCK = threading.Lock()
 ASYNC_JOB_TTL_SECONDS = 3600
 REQUEST_DIGEST_TTL_SECONDS = 3600
+_ASYNC_QUEUE: queue.Queue[str] = queue.Queue()
+_ASYNC_QUEUE_IDS: set[str] = set()
+_ASYNC_WORKER_LOCK = threading.Lock()
+_ASYNC_WORKER_STARTED = False
+_ASYNC_STATE_RESTORED = False
 app = FastAPI(title="Etsy Codex Renderer", version=APP_VERSION)
 
 
