@@ -422,7 +422,11 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
         if not async_context:
             _release_failed_request(request_hash)
         raise RuntimeError("renderer_not_ready")
-    acquired = _RENDER_LOCK.acquire(timeout=5)
+    if async_context:
+        _RENDER_LOCK.acquire()
+        acquired = True
+    else:
+        acquired = _RENDER_LOCK.acquire(timeout=5)
     if not acquired:
         if not async_context:
             _release_failed_request(request_hash)
