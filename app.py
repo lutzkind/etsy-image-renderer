@@ -493,7 +493,129 @@ _ASYNC_HASH_INDEX = globals().setdefault("_ASYNC_HASH_INDEX", {})
 _ASYNC_RENDER_CONTEXT = globals().setdefault("_ASYNC_RENDER_CONTEXT", threading.local())
 
 
+def _async_job_root() -> Path:
+    root = Path(os.environ.get("RENDER_DATA_DIR", "/data")) / "async-jobs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _async_job_meta_path(job_id: str) -> Path:
+    return _async_job_root() / f"{job_id}.json"
+
+
+def _async_job_result_path(job_id: str) -> Path:
+    return _async_job_root() / f"{job_id}.result"
+
+
+def _persist_async_job(job_id: str, job: dict[str, Any]) -> None:
+    payload = {key: value for key, value in job.items() if key != "data"}
+    target = _async_job_meta_path(job_id)
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+    os.replace(temporary, target)
+
+
+def _persist_async_result(job_id: str, data: bytes) -> str:
+    target = _async_job_result_path(job_id)
+    temporary = target.with_suffix(".result.tmp")
+    temporary.write_bytes(data)
+    os.replace(temporary, target)
+    return str(target)
+
+
+def _load_async_job(job_id: str) -> dict[str, Any]:
+    with _ASYNC_JOBS_LOCK:
+        current = _ASYNC_JOBS.get(str(job_id))
+        if current:
+            return dict(current)
+    path = _async_job_meta_path(str(job_id))
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    with _ASYNC_JOBS_LOCK:
+        _ASYNC_JOBS[str(job_id)] = dict(payload)
+    return dict(payload)
+
+
+def _load_async_result(job_id: str, job: dict[str, Any]) -> bytes:
+    data = job.get("data")
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    path = Path(str(job.get("result_path") or _async_job_result_path(job_id)))
+    if not path.is_file():
+        raise FileNotFoundError("render_result_missing")
+    return path.read_bytes()
+
+
+def _enqueue_async_job(job_id: str) -> None:
+    global _ASYNC_WORKER_STARTED
+    with _ASYNC_JOBS_LOCK:
+        if job_id in _ASYNC_QUEUE_IDS:
+            return
+        _ASYNC_QUEUE_IDS.add(job_id)
+    with _ASYNC_WORKER_LOCK:
+        if not _ASYNC_WORKER_STARTED:
+            threading.Thread(target=_async_worker_loop, daemon=True, name="etsy-codex-render-worker").start()
+            _ASYNC_WORKER_STARTED = True
+    _ASYNC_QUEUE.put(job_id)
+
+
+def _async_worker_loop() -> None:
+    while True:
+        job_id = _ASYNC_QUEUE.get()
+        with _ASYNC_JOBS_LOCK:
+            _ASYNC_QUEUE_IDS.discard(job_id)
+        try:
+            job = _load_async_job(job_id)
+            if str(job.get("status") or "") not in {"queued", "running"}:
+                continue
+            request_payload = job.get("request")
+            if not isinstance(request_payload, dict):
+                with _ASYNC_JOBS_LOCK:
+                    if job_id in _ASYNC_JOBS:
+                        _ASYNC_JOBS[job_id].update({"status": "failed", "error": "render_request_missing"})
+                        _persist_async_job(job_id, _ASYNC_JOBS[job_id])
+                continue
+            _run_async_job(job_id, RenderRequest.model_validate(request_payload))
+        finally:
+            _ASYNC_QUEUE.task_done()
+
+
+def _restore_async_state() -> None:
+    global _ASYNC_STATE_RESTORED
+    with _ASYNC_WORKER_LOCK:
+        if _ASYNC_STATE_RESTORED:
+            return
+        _ASYNC_STATE_RESTORED = True
+    for path in _async_job_root().glob("*.json"):
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        job_id = path.stem
+        status = str(payload.get("status") or "queued")
+        if status == "running":
+            payload["status"] = "queued"
+            payload["recovered_after_restart"] = True
+        request_hash = str(payload.get("request_hash") or "")
+        with _ASYNC_JOBS_LOCK:
+            _ASYNC_JOBS[job_id] = payload
+            if request_hash and status in {"queued", "running", "succeeded"}:
+                _ASYNC_HASH_INDEX[request_hash] = job_id
+        _persist_async_job(job_id, payload)
+        if str(payload.get("status") or "") == "queued":
+            _enqueue_async_job(job_id)
+
+
 def _prune_async_jobs() -> None:
+    _restore_async_state()
     cutoff = time.time() - ASYNC_JOB_TTL_SECONDS
     with _ASYNC_JOBS_LOCK:
         for job_id, job in list(_ASYNC_JOBS.items()):
@@ -511,6 +633,11 @@ def _prune_async_jobs() -> None:
                 request_hash = str(job.get("request_hash") or "")
                 if request_hash and _ASYNC_HASH_INDEX.get(request_hash) == job_id:
                     _ASYNC_HASH_INDEX.pop(request_hash, None)
+                try:
+                    _async_job_meta_path(job_id).unlink(missing_ok=True)
+                    _async_job_result_path(job_id).unlink(missing_ok=True)
+                except OSError:
+                    pass
         for request_hash, job_id in list(_ASYNC_HASH_INDEX.items()):
             if job_id not in _ASYNC_JOBS:
                 _ASYNC_HASH_INDEX.pop(request_hash, None)
@@ -524,17 +651,32 @@ def _run_async_job(job_id: str, request: RenderRequest) -> None:
         if not job:
             return
         job["status"] = "running"
+        _persist_async_job(job_id, job)
     _ASYNC_RENDER_CONTEXT.active = True
     try:
         data, mime, digest = _render(request)
         with _ASYNC_JOBS_LOCK:
             if job_id in _ASYNC_JOBS:
-                _ASYNC_JOBS[job_id].update({"status": "succeeded", "data": data, "mime": mime, "digest": digest, "output_sha256": digest})
+                result_path = _persist_async_result(job_id, data)
+                _ASYNC_JOBS[job_id].update({
+                    "status": "succeeded",
+                    "mime": mime,
+                    "digest": digest,
+                    "output_sha256": digest,
+                    "result_path": result_path,
+                    "completed_at": time.time(),
+                })
+                _persist_async_job(job_id, _ASYNC_JOBS[job_id])
     except Exception as exc:
         request_hash = _request_hash(request)
         with _ASYNC_JOBS_LOCK:
             if job_id in _ASYNC_JOBS:
-                _ASYNC_JOBS[job_id].update({"status": "failed", "error": str(exc)[:200]})
+                _ASYNC_JOBS[job_id].update({
+                    "status": "failed",
+                    "error": str(exc)[:200],
+                    "completed_at": time.time(),
+                })
+                _persist_async_job(job_id, _ASYNC_JOBS[job_id])
             if _ASYNC_HASH_INDEX.get(request_hash) == job_id:
                 _ASYNC_HASH_INDEX.pop(request_hash, None)
         _release_failed_request(request_hash)
@@ -567,7 +709,13 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return readiness()
+    _restore_async_state()
+    payload = readiness()
+    with _ASYNC_JOBS_LOCK:
+        payload["queued_jobs"] = sum(1 for job in _ASYNC_JOBS.values() if job.get("status") == "queued")
+        payload["running_jobs"] = sum(1 for job in _ASYNC_JOBS.values() if job.get("status") == "running")
+    payload["persistent_queue"] = True
+    return payload
 
 
 @app.post("/render")
@@ -599,19 +747,30 @@ def render_async(request: RenderRequest, authorization: str | None = Header(defa
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not readiness()["ready"]:
         raise HTTPException(status_code=503, detail="renderer_not_ready")
+    _restore_async_state()
     _prune_async_jobs()
     request_hash = _request_hash(request)
     with _ASYNC_JOBS_LOCK:
         existing_id = _ASYNC_HASH_INDEX.get(request_hash)
-        if existing_id:
-            existing = _ASYNC_JOBS.get(existing_id)
-            if existing and existing.get("status") in {"queued", "running", "succeeded"}:
-                return _async_job_response(existing_id, dict(existing))
-            _ASYNC_HASH_INDEX.pop(request_hash, None)
-        job_id = uuid.uuid4().hex
+    if existing_id:
+        existing = _load_async_job(existing_id)
+        if existing and existing.get("status") in {"queued", "running", "succeeded"}:
+            return _async_job_response(existing_id, existing)
+        with _ASYNC_JOBS_LOCK:
+            if _ASYNC_HASH_INDEX.get(request_hash) == existing_id:
+                _ASYNC_HASH_INDEX.pop(request_hash, None)
+    job_id = uuid.uuid4().hex
+    with _ASYNC_JOBS_LOCK:
         _ASYNC_HASH_INDEX[request_hash] = job_id
-        _ASYNC_JOBS[job_id] = {"status": "queued", "created_at": time.time(), "mode": request.mode, "request_hash": request_hash}
-    threading.Thread(target=_run_async_job, args=(job_id, request), daemon=True).start()
+        _ASYNC_JOBS[job_id] = {
+            "status": "queued",
+            "created_at": time.time(),
+            "mode": request.mode,
+            "request_hash": request_hash,
+            "request": request.model_dump(mode="json"),
+        }
+        _persist_async_job(job_id, _ASYNC_JOBS[job_id])
+    _enqueue_async_job(job_id)
     return JSONResponse({"job_id": job_id, "status": "queued", "request_hash": request_hash, "contract_version": CONTRACT_VERSION}, status_code=202)
 
 
@@ -619,8 +778,7 @@ def render_async(request: RenderRequest, authorization: str | None = Header(defa
 def render_async_status(job_id: str, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> JSONResponse:
     _require_auth(authorization, x_renderer_token)
     _prune_async_jobs()
-    with _ASYNC_JOBS_LOCK:
-        job = dict(_ASYNC_JOBS.get(str(job_id)) or {})
+    job = _load_async_job(str(job_id))
     if not job:
         raise HTTPException(status_code=404, detail="render_job_not_found")
     return _async_job_response(str(job_id), job)
@@ -630,8 +788,7 @@ def render_async_status(job_id: str, authorization: str | None = Header(default=
 def render_async_result(job_id: str, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> Response:
     _require_auth(authorization, x_renderer_token)
     _prune_async_jobs()
-    with _ASYNC_JOBS_LOCK:
-        job = dict(_ASYNC_JOBS.get(str(job_id)) or {})
+    job = _load_async_job(str(job_id))
     if not job:
         raise HTTPException(status_code=404, detail="render_job_not_found")
     status = str(job.get("status") or "queued")
@@ -639,7 +796,11 @@ def render_async_result(job_id: str, authorization: str | None = Header(default=
         raise HTTPException(status_code=202, detail="render_job_not_ready")
     if status == "failed":
         raise HTTPException(status_code=409, detail=str(job.get("error") or "codex_render_failed"))
-    return Response(content=bytes(job.get("data") or b""), media_type=str(job.get("mime") or "image/png"), headers={
+    try:
+        data = _load_async_result(str(job_id), job)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=410, detail="render_result_missing") from exc
+    return Response(content=data, media_type=str(job.get("mime") or "image/png"), headers={
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Image-Sha256": str(job.get("output_sha256") or job.get("digest") or ""),
         "X-Render-Request-Sha256": str(job.get("request_hash") or ""),
