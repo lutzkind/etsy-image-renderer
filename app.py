@@ -651,17 +651,32 @@ def _run_async_job(job_id: str, request: RenderRequest) -> None:
         if not job:
             return
         job["status"] = "running"
+        _persist_async_job(job_id, job)
     _ASYNC_RENDER_CONTEXT.active = True
     try:
         data, mime, digest = _render(request)
         with _ASYNC_JOBS_LOCK:
             if job_id in _ASYNC_JOBS:
-                _ASYNC_JOBS[job_id].update({"status": "succeeded", "data": data, "mime": mime, "digest": digest, "output_sha256": digest})
+                result_path = _persist_async_result(job_id, data)
+                _ASYNC_JOBS[job_id].update({
+                    "status": "succeeded",
+                    "mime": mime,
+                    "digest": digest,
+                    "output_sha256": digest,
+                    "result_path": result_path,
+                    "completed_at": time.time(),
+                })
+                _persist_async_job(job_id, _ASYNC_JOBS[job_id])
     except Exception as exc:
         request_hash = _request_hash(request)
         with _ASYNC_JOBS_LOCK:
             if job_id in _ASYNC_JOBS:
-                _ASYNC_JOBS[job_id].update({"status": "failed", "error": str(exc)[:200]})
+                _ASYNC_JOBS[job_id].update({
+                    "status": "failed",
+                    "error": str(exc)[:200],
+                    "completed_at": time.time(),
+                })
+                _persist_async_job(job_id, _ASYNC_JOBS[job_id])
             if _ASYNC_HASH_INDEX.get(request_hash) == job_id:
                 _ASYNC_HASH_INDEX.pop(request_hash, None)
         _release_failed_request(request_hash)
