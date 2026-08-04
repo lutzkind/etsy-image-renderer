@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 CONTRACT_VERSION = "luxlm-render-contract-v2"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
