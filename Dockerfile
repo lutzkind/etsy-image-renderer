@@ -22,6 +22,8 @@ RUN groupadd --system --gid 10001 etsy-renderer \
     && useradd --system --uid 10001 --gid 10001 --home-dir /home/etsy-renderer --create-home --shell /usr/sbin/nologin etsy-renderer \
     && mkdir -p /data /home/etsy-renderer /tmp/etsy-codex-home \
     && chown -R 10001:10001 /data /home/etsy-renderer /tmp/etsy-codex-home \
+    && chown 10001:0 /tmp/etsy-codex-home \
+    && chmod 0770 /tmp/etsy-codex-home \
     && chmod 0555 /usr/local/bin/etsy-renderer-entrypoint
 
 EXPOSE 8080
