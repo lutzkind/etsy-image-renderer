@@ -194,8 +194,8 @@ def test_command_enables_image_generation(tmp_path):
     assert command[command.index("--enable") + 1] == "image_generation"
     assert "--ephemeral" in command
     assert command[command.index("--sandbox") + 1] == "workspace-write"
-    assert "--ask-for-approval" in command
-    assert command[command.index("--ask-for-approval") + 1] == "never"
+    assert "-c" in command
+    assert 'approval_policy="never"' in command
     assert "--ignore-user-config" in command
     assert command[-1] == "-"
 
