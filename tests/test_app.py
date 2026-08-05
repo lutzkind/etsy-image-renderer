@@ -194,8 +194,8 @@ def test_command_enables_image_generation(tmp_path):
     assert command[command.index("--enable") + 1] == "image_generation"
     assert "--ephemeral" in command
     assert command[command.index("--sandbox") + 1] == "workspace-write"
-    assert "--ask-for-approval" in command
-    assert command[command.index("--ask-for-approval") + 1] == "never"
+    assert "-c" in command
+    assert 'approval_policy="never"' in command
     assert "--ignore-user-config" in command
     assert command[-1] == "-"
 
@@ -217,6 +217,8 @@ def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     assert "setpriv" in entrypoint_text
     assert "auth_source=/root/.codex/auth.json" in entrypoint_text
     assert 'chown -R "$runtime_uid:$runtime_gid" "$render_data_dir"' in entrypoint_text
+    assert 'chown "$runtime_uid:0" "$codex_home"' in entrypoint_text
+    assert 'chmod 0770 "$codex_home"' in entrypoint_text
     assert "chown 10001:0 /tmp/etsy-codex-home" in dockerfile_text
     assert "chmod 0770 /tmp/etsy-codex-home" in dockerfile_text
 

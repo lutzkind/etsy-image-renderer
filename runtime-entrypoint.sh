@@ -11,9 +11,11 @@ if [ "$(id -u)" -eq 0 ]; then
     if [ -n "$auth_source" ] && [ ! -r "$auth_source" ] && [ -r /root/.codex/auth.json ]; then
         auth_source=/root/.codex/auth.json
     fi
+    mkdir -p "$codex_home"
+    chown "$runtime_uid:0" "$codex_home"
+    chmod 0770 "$codex_home"
     if [ -n "$auth_source" ]; then
         test -r "$auth_source"
-        mkdir -p "$codex_home"
         cp "$auth_source" "$codex_home/auth.json"
         chown "$runtime_uid:$runtime_gid" "$codex_home/auth.json"
         chmod 0600 "$codex_home/auth.json"
