@@ -8,6 +8,9 @@ codex_home="${CODEX_HOME:-/tmp/etsy-codex-home}"
 render_data_dir="${RENDER_DATA_DIR:-}"
 
 if [ "$(id -u)" -eq 0 ]; then
+    if [ -n "$auth_source" ] && [ ! -r "$auth_source" ] && [ -r /root/.codex/auth.json ]; then
+        auth_source=/root/.codex/auth.json
+    fi
     if [ -n "$auth_source" ]; then
         test -r "$auth_source"
         mkdir -p "$codex_home"
