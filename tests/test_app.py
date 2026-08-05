@@ -193,7 +193,29 @@ def test_command_enables_image_generation(tmp_path):
     assert command[:2] == ["codex", "exec"]
     assert command[command.index("--enable") + 1] == "image_generation"
     assert "--ephemeral" in command
+    assert command[command.index("--sandbox") + 1] == "workspace-write"
+    assert "--ask-for-approval" in command
+    assert command[command.index("--ask-for-approval") + 1] == "never"
+    assert "--ignore-user-config" in command
     assert command[-1] == "-"
+
+
+def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
+    compose = Path(__file__).parents[1] / "docker-compose.yaml"
+    dockerfile = Path(__file__).parents[1] / "Dockerfile"
+    entrypoint = Path(__file__).parents[1] / "runtime-entrypoint.sh"
+    compose_text = compose.read_text(encoding="utf-8")
+    dockerfile_text = dockerfile.read_text(encoding="utf-8")
+    entrypoint_text = entrypoint.read_text(encoding="utf-8")
+
+    assert "read_only: true" in compose_text
+    assert "cap_drop: [ALL]" in compose_text
+    assert "no-new-privileges:true" in compose_text
+    assert "/run/secrets/codex-auth.json:ro" in compose_text
+    assert ":/root/.codex/auth.json" not in compose_text
+    assert "CODEX_HOME=/tmp/etsy-codex-home" in compose_text
+    assert "setpriv" in entrypoint_text
+    assert 'chown -R "$runtime_uid:$runtime_gid" "$render_data_dir"' in entrypoint_text
 
 
 def test_render_endpoint_requires_auth(monkeypatch):
