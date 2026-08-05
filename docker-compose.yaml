@@ -4,15 +4,23 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH, FOWNER, SETGID, SETPCAP, SETUID]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /run:rw,nosuid,nodev,size=32m
+      - /tmp:rw,nosuid,nodev,size=512m
     environment:
       - SERVICE_URL_ETSY_CODEX_RENDERER_8080=/
       - ETSY_CODEX_RENDERER_TOKEN
-      - CODEX_HOME=/root/.codex
+      - CODEX_HOME=/tmp/etsy-codex-home
+      - CODEX_AUTH_SOURCE=/run/secrets/codex-auth.json
       - RENDER_DATA_DIR=/data
       - CODEX_RENDER_TIMEOUT_SECONDS
     volumes:
       - renderer-data:/data
-      - /root/.codex/auth.json:/root/.codex/auth.json:ro
+      - /root/.codex/auth.json:/run/secrets/codex-auth.json:ro
     expose:
       - "8080"
     networks:
