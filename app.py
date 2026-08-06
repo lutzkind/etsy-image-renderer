@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 CONTRACT_VERSION = "luxlm-render-contract-v2"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
@@ -285,7 +285,8 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
         role_lines.append(f"Asset {index}: role={role.role}; preservation={preservation}; {transform}.")
     if request.mode == "designed_card":
         common = (
-            "Use the built-in image_gen/image_generation tool exactly once. Do not call an external image API, do not run image_gen.py, "
+            "Use the built-in image_gen/image_generation tool exactly once before writing any response. Do not answer with a plan or textual refusal. "
+            "Do not call an external image API, do not run image_gen.py, "
             "and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one complete premium Etsy gallery card. "
             "Preserve supplied people, identities, artwork, and exact-pixel assets. Use exactly the approved card_brief headline, body, and bullets, "
             "and no other text; never invent, paraphrase, transcribe, or add copy. Adapt composition, palette, and visual language to the listing theme. "
@@ -472,7 +473,12 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                 mime, _ = _sniff_image(data)
                 unique[hashlib.sha256(data).hexdigest()] = (data, mime)
             if not unique:
-                raise RuntimeError("output_missing")
+                candidate_names = sorted(path.name for path in workspace.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+                raise RuntimeError(
+                    "output_missing:"
+                    f"returncode={result.returncode};stdout_bytes={len(result.stdout or '')};"
+                    f"stderr_bytes={len(result.stderr or '')};workspace_image_candidates={len(candidate_names)}"
+                )
             if len(unique) != 1:
                 raise RuntimeError("output_ambiguous")
             digest, (data, mime) = next(iter(unique.items()))
