@@ -285,7 +285,7 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
         role_lines.append(f"Asset {index}: role={role.role}; preservation={preservation}; {transform}.")
     if request.mode == "designed_card":
         common = (
-            "Before writing any textual response, you MUST invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. "
+            "$imagegen\nBefore writing any textual response, you MUST invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. "
             "Use the built-in image_gen/image_generation tool exactly once; do not answer with a plan, refusal, or confirmation before that tool call. "
             "If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. "
             "Do not call an external image API, do not run image_gen.py, "
