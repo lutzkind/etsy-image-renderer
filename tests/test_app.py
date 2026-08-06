@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import subprocess
 import sys
@@ -61,7 +62,7 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.4.2"
+    assert renderer.APP_VERSION == "1.4.3"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
         "before_after_card": 2, "information_card": 2,
@@ -171,7 +172,8 @@ def test_template_reference_is_extra_command_image_without_changing_listing_coun
         workspace = Path(command[command.index("-C") + 1])
         output = workspace / "rendered-output.png"
         output.write_bytes(PNG + b"out")
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        event = json.dumps({"type": "item.completed", "item": {"type": "image_generation_call"}})
+        return subprocess.CompletedProcess(command, 0, stdout=event, stderr="")
 
     monkeypatch.setattr(renderer, "_download_image", fake_download)
     monkeypatch.setattr(renderer.subprocess, "run", fake_run)
@@ -184,6 +186,9 @@ def test_template_reference_is_extra_command_image_without_changing_listing_coun
     assert command_seen["command"].count("-i") == 3
     assert "DESIGN REFERENCE ONLY" in command_seen["prompt"]
     assert "inspiration-only" in command_seen["prompt"]
+    proof = renderer._load_fresh_proof()
+    assert proof["app_version"] == renderer.APP_VERSION
+    assert proof["modes"]["designed_card"]["output_sha256"]
 
 
 def test_legacy_lifestyle_prompt_keeps_image_two_ground_truth():
@@ -215,6 +220,27 @@ def test_codex_event_summary_distinguishes_image_tool_events():
     assert renderer._stderr_markers("image tool unavailable") == "image,tool"
 
 
+def test_fresh_capability_status_requires_current_generation_proofs(tmp_path, monkeypatch):
+    monkeypatch.setenv("RENDER_DATA_DIR", str(tmp_path / "render-data"))
+    initial = renderer._fresh_capability_status()
+    assert initial["fresh_render_verified"] is False
+    assert initial["fresh_gallery_capability_verified"] is False
+
+    proof = {
+        "schema_version": renderer.FRESH_PROOF_SCHEMA_VERSION,
+        "app_version": renderer.APP_VERSION,
+        "modes": {
+            mode: {"app_version": renderer.APP_VERSION, "event_summary": "item.completed;items=image_generation_call"}
+            for mode in renderer.REQUIRED_FRESH_MODES
+        },
+    }
+    renderer._fresh_proof_path().write_text(json.dumps(proof), encoding="utf-8")
+    verified = renderer._fresh_capability_status()
+    assert verified["fresh_render_verified"] is True
+    assert verified["fresh_gallery_capability_verified"] is True
+    assert verified["verified_fresh_modes"] == sorted(renderer.REQUIRED_FRESH_MODES)
+
+
 def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     compose = Path(__file__).parents[1] / "docker-compose.yaml"
     dockerfile = Path(__file__).parents[1] / "Dockerfile"
@@ -234,6 +260,8 @@ def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     assert 'chown -R "$runtime_uid:$runtime_gid" "$render_data_dir"' in entrypoint_text
     assert 'chown "$runtime_uid:0" "$codex_home"' in entrypoint_text
     assert 'chmod 0770 "$codex_home"' in entrypoint_text
+    assert "codex-system-skills/imagegen" in entrypoint_text
+    assert "codex-system-skills/imagegen" in dockerfile_text
     assert "chown 10001:0 /tmp/etsy-codex-home" in dockerfile_text
     assert "chmod 0770 /tmp/etsy-codex-home" in dockerfile_text
 

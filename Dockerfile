@@ -18,6 +18,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY runtime-entrypoint.sh /usr/local/bin/etsy-renderer-entrypoint
+COPY codex-skills/imagegen /opt/codex-system-skills/imagegen
 RUN groupadd --system --gid 10001 etsy-renderer \
     && useradd --system --uid 10001 --gid 10001 --home-dir /home/etsy-renderer --create-home --shell /usr/sbin/nologin etsy-renderer \
     && mkdir -p /data /home/etsy-renderer /tmp/etsy-codex-home \

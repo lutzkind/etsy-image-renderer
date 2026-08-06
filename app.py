@@ -24,8 +24,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 CONTRACT_VERSION = "luxlm-render-contract-v2"
+FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
+FRESH_PROOF_FILENAME = "fresh-render-proof.json"
+REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
@@ -300,7 +303,7 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
         instruction = "Create one cohesive, premium editorial Etsy gallery card for the supplied listing and module."
     else:
         common = (
-            "Use the built-in image_gen/image_generation tool exactly once. Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one polished raster image, then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it. This is a decorative visual asset, not the final typography compositor. Never generate words, letters, numbers, pseudo-lettering, signatures, logos, watermarks, blank caption sheets, paper mats, empty label regions, marketing panels, generic information panels, prices, badges, or invented claims. Do not copy competitor branding, exact coordinates, distinctive protected elements, or source-image text. Preserve any role marked exact pixel preservation; the final system may composite that raster deterministically afterward."
+            "$imagegen\nBefore writing any textual response, invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one polished raster image, then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it. This is a decorative visual asset, not the final typography compositor. Never generate words, letters, numbers, pseudo-lettering, signatures, logos, watermarks, blank caption sheets, paper mats, empty label regions, marketing panels, generic information panels, prices, badges, or invented claims. Do not copy competitor branding, exact coordinates, distinctive protected elements, or source-image text. Preserve any role marked exact pixel preservation; the final system may composite that raster deterministically afterward."
         )
         instruction = {
             "minimal_frame": "Create a restrained ecommerce frame presentation around the exact finished artwork.",
@@ -377,6 +380,67 @@ def _codex_event_summary(raw: str) -> str:
                 if item_type:
                     item_types.add(item_type)
     return (",".join(sorted(event_types)) or "none") + ";items=" + (",".join(sorted(item_types)) or "none")
+
+
+def _fresh_proof_path() -> Path:
+    root = Path(os.environ.get("RENDER_DATA_DIR", "/data"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root / FRESH_PROOF_FILENAME
+
+
+def _load_fresh_proof() -> dict[str, Any]:
+    try:
+        payload = json.loads(_fresh_proof_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _record_fresh_proof(mode: str, request_hash: str, output_sha256: str, event_summary: str) -> None:
+    if "image_generation_call" not in event_summary:
+        return
+    current = _load_fresh_proof()
+    modes = current.get("modes") if (
+        current.get("schema_version") == FRESH_PROOF_SCHEMA_VERSION
+        and current.get("app_version") == APP_VERSION
+        and isinstance(current.get("modes"), dict)
+    ) else {}
+    modes[str(mode)] = {
+        "app_version": APP_VERSION,
+        "completed_at": time.time(),
+        "request_hash": request_hash,
+        "output_sha256": output_sha256,
+        "event_summary": event_summary,
+    }
+    payload = {
+        "schema_version": FRESH_PROOF_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
+        "modes": modes,
+    }
+    target = _fresh_proof_path()
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def _fresh_capability_status() -> dict[str, Any]:
+    proof = _load_fresh_proof()
+    proof_current = proof.get("schema_version") == FRESH_PROOF_SCHEMA_VERSION and proof.get("app_version") == APP_VERSION
+    modes = proof.get("modes") if proof_current and isinstance(proof.get("modes"), dict) else {}
+    verified_modes = sorted(
+        mode for mode in REQUIRED_FRESH_MODES
+        if isinstance(modes.get(mode), dict)
+        and str(modes[mode].get("app_version") or "") == APP_VERSION
+        and "image_generation_call" in str(modes[mode].get("event_summary") or "")
+    )
+    return {
+        "fresh_render_verified": "designed_card" in verified_modes,
+        "fresh_gallery_capability_verified": set(verified_modes) == set(REQUIRED_FRESH_MODES),
+        "required_fresh_modes": list(REQUIRED_FRESH_MODES),
+        "verified_fresh_modes": verified_modes,
+        "fresh_proof_schema_version": str(proof.get("schema_version") or ""),
+        "fresh_proof_app_version": str(proof.get("app_version") or ""),
+    }
 
 
 def _stderr_markers(raw: str) -> str:
@@ -494,6 +558,7 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                 if any(term in combined for term in ("not logged in", "unauthorized", "401")):
                     raise RuntimeError("codex_authentication_failed")
                 raise RuntimeError("codex_render_failed")
+            event_summary = _codex_event_summary(result.stdout)
             unique: dict[str, tuple[bytes, str]] = {}
             for path in outputs:
                 data = path.read_bytes()
@@ -507,11 +572,14 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                     "output_missing:"
                     f"returncode={result.returncode};stdout_bytes={len(result.stdout or '')};"
                     f"stderr_bytes={len(result.stderr or '')};workspace_image_candidates={len(candidate_names)};"
-                    f"stdout_events={_codex_event_summary(result.stdout)};stderr_markers={_stderr_markers(result.stderr)}"
+                    f"stdout_events={event_summary};stderr_markers={_stderr_markers(result.stderr)}"
                 )
             if len(unique) != 1:
                 raise RuntimeError("output_ambiguous")
             digest, (data, mime) = next(iter(unique.items()))
+            if "image_generation_call" not in event_summary:
+                raise RuntimeError(f"image_generation_event_missing:stdout_events={event_summary}")
+            _record_fresh_proof(request.mode, request_hash, digest, event_summary)
             with _REQUEST_DIGESTS_LOCK:
                 if request_hash in _REQUEST_DIGESTS:
                     _REQUEST_DIGESTS[request_hash].update({"status": "succeeded", "output_sha256": digest})
@@ -753,6 +821,7 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
 def health() -> dict[str, Any]:
     _restore_async_state()
     payload = readiness()
+    payload.update(_fresh_capability_status())
     with _ASYNC_JOBS_LOCK:
         payload["queued_jobs"] = sum(1 for job in _ASYNC_JOBS.values() if job.get("status") == "queued")
         payload["running_jobs"] = sum(1 for job in _ASYNC_JOBS.values() if job.get("status") == "running")

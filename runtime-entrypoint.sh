@@ -14,6 +14,12 @@ if [ "$(id -u)" -eq 0 ]; then
     mkdir -p "$codex_home"
     chown "$runtime_uid:0" "$codex_home"
     chmod 0770 "$codex_home"
+    mkdir -p "$codex_home/skills/.system"
+    if [ -d /opt/codex-system-skills/imagegen ]; then
+        rm -rf "$codex_home/skills/.system/imagegen"
+        cp -R /opt/codex-system-skills/imagegen "$codex_home/skills/.system/imagegen"
+        chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills/.system/imagegen"
+    fi
     if [ -n "$auth_source" ]; then
         test -r "$auth_source"
         cp "$auth_source" "$codex_home/auth.json"
