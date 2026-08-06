@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as renderer
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"test"
