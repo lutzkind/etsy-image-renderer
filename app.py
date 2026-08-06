@@ -356,6 +356,35 @@ def _new_outputs(workspace: Path, before: dict[str, tuple[int, int]], inputs: li
     return outputs
 
 
+def _codex_event_summary(raw: str) -> str:
+    event_types: set[str] = set()
+    item_types: set[str] = set()
+    for line in str(raw or "").splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(event, dict):
+            event_type = str(event.get("type") or "").strip()
+            if event_type:
+                event_types.add(event_type)
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_type = str(item.get("type") or "").strip()
+                if item_type:
+                    item_types.add(item_type)
+    return (",".join(sorted(event_types)) or "none") + ";items=" + (",".join(sorted(item_types)) or "none")
+
+
+def _stderr_markers(raw: str) -> str:
+    value = str(raw or "").lower()
+    markers = (
+        "error", "failed", "image", "tool", "unsupported", "not available",
+        "permission", "unauthorized", "rate", "limit", "refusal",
+    )
+    return ",".join(marker for marker in markers if marker in value) or "none"
+
+
 def _codex_command(workspace: Path, inputs: list[Path]) -> list[str]:
     command = [
         "codex", "exec", "--skip-git-repo-check", "--ignore-user-config",
@@ -474,7 +503,8 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                 raise RuntimeError(
                     "output_missing:"
                     f"returncode={result.returncode};stdout_bytes={len(result.stdout or '')};"
-                    f"stderr_bytes={len(result.stderr or '')};workspace_image_candidates={len(candidate_names)}"
+                    f"stderr_bytes={len(result.stderr or '')};workspace_image_candidates={len(candidate_names)};"
+                    f"stdout_events={_codex_event_summary(result.stdout)};stderr_markers={_stderr_markers(result.stderr)}"
                 )
             if len(unique) != 1:
                 raise RuntimeError("output_ambiguous")

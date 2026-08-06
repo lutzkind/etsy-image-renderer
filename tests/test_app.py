@@ -204,6 +204,17 @@ def test_command_enables_image_generation(tmp_path):
     assert command[-1] == "-"
 
 
+def test_codex_event_summary_distinguishes_image_tool_events():
+    raw = '\n'.join([
+        '{"type":"thread.started"}',
+        '{"type":"item.completed","item":{"type":"image_generation_call"}}',
+    ])
+    summary = renderer._codex_event_summary(raw)
+    assert "image_generation_call" in summary
+    assert "thread.started" in summary
+    assert renderer._stderr_markers("image tool unavailable") == "image,tool"
+
+
 def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     compose = Path(__file__).parents[1] / "docker-compose.yaml"
     dockerfile = Path(__file__).parents[1] / "Dockerfile"
