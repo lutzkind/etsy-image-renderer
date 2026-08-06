@@ -17,7 +17,9 @@ AUTH = {"Authorization": "Bearer secret"}
 
 
 @pytest.fixture(autouse=True)
-def clear_state():
+def clear_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("RENDER_DATA_DIR", str(tmp_path / "render-data"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     renderer._REQUEST_DIGESTS.clear()
     renderer._ASYNC_JOBS.clear()
     renderer._ASYNC_HASH_INDEX.clear()
