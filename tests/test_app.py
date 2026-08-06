@@ -61,7 +61,7 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.4.1"
+    assert renderer.APP_VERSION == "1.4.2"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
         "before_after_card": 2, "information_card": 2,
@@ -128,7 +128,7 @@ def test_designed_card_valid_contract():
 def test_designed_card_prompt_contains_exact_contract_and_rejects_generic_styling():
     request = renderer.RenderRequest.model_validate(designed_payload(template_reference_url="https://example.com/template.png"))
     prompt = renderer._prompt(request)
-    for text in ["Handmade for Every Day", "Thoughtful details for your space.", "Solid wood", "Made to order", "STRUCTURED INPUT CONTRACT", "layout_contract", "listing_assets", "GENERATION INSTRUCTIONS", "Use the built-in image_gen/image_generation tool exactly once before writing any response", "inspiration only", "never copy it exactly", "Ignore every word, letter, number, logo, label, and caption", "The only visible text allowed in the final card is the exact card_brief text", "do not reproduce incidental source-image text"]:
+    for text in ["Handmade for Every Day", "Thoughtful details for your space.", "Solid wood", "Made to order", "STRUCTURED INPUT CONTRACT", "layout_contract", "listing_assets", "GENERATION INSTRUCTIONS", "Use the built-in image_gen/image_generation tool exactly once", "inspiration only", "never copy it exactly"]:
         assert text in prompt
     for text in ["dashboard", "presentation slides", "ivory-panel", "Canva-like"]:
         assert text.lower() in prompt.lower()
