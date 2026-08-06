@@ -285,7 +285,10 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
         role_lines.append(f"Asset {index}: role={role.role}; preservation={preservation}; {transform}.")
     if request.mode == "designed_card":
         common = (
-            "Use the built-in image_gen/image_generation tool exactly once. Do not call an external image API, do not run image_gen.py, "
+            "Before writing any textual response, you MUST invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. "
+            "Use the built-in image_gen/image_generation tool exactly once; do not answer with a plan, refusal, or confirmation before that tool call. "
+            "If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. "
+            "Do not call an external image API, do not run image_gen.py, "
             "and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one complete premium Etsy gallery card. "
             "Preserve supplied people, identities, artwork, and exact-pixel assets. Use exactly the approved card_brief headline, body, and bullets, "
             "and no other text; never invent, paraphrase, or add copy. Adapt composition, palette, and visual language to the listing theme. "
