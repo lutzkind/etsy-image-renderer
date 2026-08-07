@@ -202,6 +202,7 @@ def test_app_server_command_enables_image_generation():
     command = renderer._codex_app_server_command()
     assert command[:2] == ["codex", "app-server"]
     assert command[command.index("--enable") + 1] == "image_generation"
+    assert renderer._codex_app_server_sandbox() == ("danger-full-access", {"type": "dangerFullAccess"})
 
 
 def test_app_server_input_has_explicit_skill_and_local_images(tmp_path, monkeypatch):

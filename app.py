@@ -473,6 +473,15 @@ def _codex_app_server_command() -> list[str]:
     ]
 
 
+def _codex_app_server_sandbox() -> tuple[str, dict[str, str]]:
+    # The renderer is already isolated by its read-only, capability-dropped
+    # container.  Codex's nested bubblewrap sandbox cannot create a user
+    # namespace in that container, which prevents image tools from reading
+    # the local reference files.  Full access here is limited to the
+    # container boundary and is required for the built-in image tool.
+    return "danger-full-access", {"type": "dangerFullAccess"}
+
+
 def _codex_skill_path() -> Path:
     return _codex_home() / "skills" / ".system" / "imagegen" / "SKILL.md"
 
@@ -608,7 +617,7 @@ def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, time
                 "params": {
                     "cwd": str(workspace),
                     "approvalPolicy": "never",
-                    "sandbox": "workspace-write",
+                    "sandbox": _codex_app_server_sandbox()[0],
                     "ephemeral": True,
                 },
             })
@@ -624,11 +633,7 @@ def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, time
                         "threadId": thread_id,
                         "input": _codex_app_server_inputs(prompt, inputs),
                         "approvalPolicy": "never",
-                        "sandboxPolicy": {
-                            "type": "workspaceWrite",
-                            "writableRoots": [str(workspace)],
-                            "networkAccess": False,
-                        },
+                        "sandboxPolicy": _codex_app_server_sandbox()[1],
                         "cwd": str(workspace),
                     },
                 })
