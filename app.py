@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import os
+import selectors
 import shutil
 import socket
 import subprocess
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -24,7 +26,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.5.0"
 CONTRACT_VERSION = "luxlm-render-contract-v2"
 FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
@@ -375,9 +377,14 @@ def _codex_event_summary(raw: str) -> str:
             if event_type:
                 event_types.add(event_type)
             item = event.get("item")
+            if not isinstance(item, dict):
+                params = event.get("params")
+                item = params.get("item") if isinstance(params, dict) else None
             if isinstance(item, dict):
                 item_type = str(item.get("type") or "").strip()
                 if item_type:
+                    if item_type in {"imageGeneration", "image_generation"}:
+                        item_type = "image_generation_call"
                     item_types.add(item_type)
     return (",".join(sorted(event_types)) or "none") + ";items=" + (",".join(sorted(item_types)) or "none")
 
@@ -452,16 +459,220 @@ def _stderr_markers(raw: str) -> str:
     return ",".join(marker for marker in markers if marker in value) or "none"
 
 
-def _codex_command(workspace: Path, inputs: list[Path]) -> list[str]:
-    command = [
-        "codex", "exec", "--skip-git-repo-check", "--ignore-user-config",
-        "-c", 'approval_policy="never"', "--sandbox", "workspace-write",
-        "--ephemeral", "--enable", "image_generation", "-C", str(workspace), "--json",
+@dataclass(frozen=True)
+class _CodexRun:
+    returncode: int
+    stdout: str
+    stderr: str
+    saved_paths: tuple[Path, ...] = ()
+
+
+def _codex_app_server_command() -> list[str]:
+    return [
+        "codex", "app-server", "--enable", "image_generation", "--listen", "stdio://",
     ]
-    for path in inputs:
-        command.extend(["-i", str(path)])
-    command.append("-")
-    return command
+
+
+def _codex_skill_path() -> Path:
+    return _codex_home() / "skills" / ".system" / "imagegen" / "SKILL.md"
+
+
+def _app_server_item(event: dict[str, Any]) -> dict[str, Any] | None:
+    item = event.get("item")
+    if isinstance(item, dict):
+        return item
+    params = event.get("params")
+    if isinstance(params, dict) and isinstance(params.get("item"), dict):
+        return params["item"]
+    return None
+
+
+def _safe_saved_paths(raw: str, workspace: Path, inputs: list[Path]) -> tuple[Path, ...]:
+    allowed_roots = (workspace.resolve(), (_codex_home() / "generated_images").resolve())
+    excluded = {path.resolve() for path in inputs}
+    paths: dict[str, Path] = {}
+    for line in str(raw or "").splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        item = _app_server_item(event)
+        if not isinstance(item, dict) or item.get("type") != "imageGeneration":
+            continue
+        saved_path = item.get("savedPath")
+        if not isinstance(saved_path, str) or not saved_path:
+            continue
+        candidate = Path(saved_path)
+        if not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in excluded or not resolved.is_file() or resolved.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        if not any(root == resolved or root in resolved.parents for root in allowed_roots):
+            continue
+        paths[str(resolved)] = resolved
+    return tuple(paths.values())
+
+
+def _codex_app_server_inputs(prompt: str, inputs: list[Path]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    items.extend({"type": "localImage", "path": str(path)} for path in inputs)
+    items.append({"type": "skill", "name": "imagegen", "path": str(_codex_skill_path())})
+    return items
+
+
+def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, timeout: int) -> _CodexRun:
+    if not _codex_skill_path().is_file():
+        return _CodexRun(1, "", "image_generation_skill_missing")
+
+    process = subprocess.Popen(
+        _codex_app_server_command(),
+        cwd=workspace,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    stdout_lines: list[str] = []
+    stderr_chunks: list[str] = []
+    completed = False
+    protocol_error = ""
+
+    def send(message: dict[str, Any]) -> None:
+        if process.stdin is None:
+            raise OSError("codex_app_server_stdin_missing")
+        process.stdin.write((json.dumps(message, ensure_ascii=True) + "\n").encode())
+        process.stdin.flush()
+
+    buffers: dict[int, bytes] = {}
+
+    def read_messages(deadline: float, predicate: Any) -> dict[str, Any] | None:
+        while time.time() < deadline:
+            for key, _ in selector.select(min(0.5, max(0.05, deadline - time.time()))):
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.data == "stderr":
+                    stderr_chunks.append(data.decode("utf-8", errors="replace"))
+                    continue
+                fd = key.fileobj.fileno()
+                buffers[fd] = buffers.get(fd, b"") + data
+                while b"\n" in buffers[fd]:
+                    line, buffers[fd] = buffers[fd].split(b"\n", 1)
+                    rendered = line.decode("utf-8", errors="replace").strip()
+                    if not rendered:
+                        continue
+                    stdout_lines.append(rendered)
+                    try:
+                        event = json.loads(rendered)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(event, dict) and predicate(event):
+                        return event
+            if process.poll() is not None:
+                break
+        return None
+
+    try:
+        send({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "etsy-codex-renderer",
+                    "title": "Etsy Codex renderer",
+                    "version": APP_VERSION,
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        initialize = read_messages(time.time() + min(timeout, 20), lambda event: event.get("id") == 1)
+        if not initialize or initialize.get("error"):
+            protocol_error = "codex_app_server_initialize_failed"
+        else:
+            send({"method": "initialized"})
+            send({
+                "method": "thread/start",
+                "id": 2,
+                "params": {
+                    "cwd": str(workspace),
+                    "approvalPolicy": "never",
+                    "sandbox": "workspace-write",
+                    "ephemeral": True,
+                },
+            })
+            thread_response = read_messages(time.time() + min(timeout, 20), lambda event: event.get("id") == 2)
+            thread_id = ((thread_response or {}).get("result") or {}).get("thread", {}).get("id")
+            if not thread_id:
+                protocol_error = "codex_app_server_thread_start_failed"
+            else:
+                send({
+                    "method": "turn/start",
+                    "id": 3,
+                    "params": {
+                        "threadId": thread_id,
+                        "input": _codex_app_server_inputs(prompt, inputs),
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {
+                            "type": "workspaceWrite",
+                            "writableRoots": [str(workspace)],
+                            "networkAccess": False,
+                        },
+                        "cwd": str(workspace),
+                    },
+                })
+
+                def is_turn_complete(event: dict[str, Any]) -> bool:
+                    return event.get("method") == "turn/completed"
+
+                completed_event = read_messages(time.time() + timeout, is_turn_complete)
+                if completed_event:
+                    completed = True
+                    turn = (completed_event.get("params") or {}).get("turn") or {}
+                    if str(turn.get("status") or "completed") not in {"completed", "succeeded"}:
+                        protocol_error = "codex_app_server_turn_failed"
+                elif not protocol_error:
+                    protocol_error = "codex_app_server_timeout"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        protocol_error = protocol_error or "codex_app_server_protocol_failed"
+    finally:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except OSError:
+            pass
+        if process.poll() is None:
+            process.terminate()
+        try:
+            tail_stdout, tail_stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            tail_stdout, tail_stderr = process.communicate()
+        if tail_stdout:
+            stdout_lines.extend(tail_stdout.decode("utf-8", errors="replace").splitlines())
+        if tail_stderr:
+            stderr_chunks.append(tail_stderr.decode("utf-8", errors="replace"))
+        selector.close()
+
+    if protocol_error:
+        stderr_chunks.append(protocol_error)
+    return _CodexRun(
+        0 if completed and not protocol_error else 1,
+        "\n".join(stdout_lines),
+        "\n".join(stderr_chunks),
+        _safe_saved_paths("\n".join(stdout_lines), workspace, inputs),
+    )
 
 
 def readiness() -> dict[str, Any]:
@@ -549,8 +760,9 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
             prompt_context = ""
             if reference is not None:
                 prompt_context = "The final supplied image is DESIGN REFERENCE ONLY and is inspiration-only. Do not treat it as a listing asset, do not preserve its pixels, and do not copy it exactly."
-            result = subprocess.run(_codex_command(workspace, command_inputs), cwd=workspace, input=_prompt(request, prompt_context), text=True, capture_output=True, timeout=timeout, check=False)
+            result = _run_codex_app_server(workspace, command_inputs, _prompt(request, prompt_context), timeout)
             outputs = _new_outputs(workspace, before, command_inputs)
+            outputs.extend(path for path in result.saved_paths if path not in outputs)
             if result.returncode != 0:
                 combined = ((result.stderr or "") + "\n" + (result.stdout or "")).lower()
                 if any(term in combined for term in ("usage limit", "quota", "too many requests", "429")):

@@ -62,7 +62,7 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.4.3"
+    assert renderer.APP_VERSION == "1.5.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
         "before_after_card": 2, "information_card": 2,
@@ -153,7 +153,7 @@ def test_prompt_preserves_exact_pixel_and_forbids_direct_api_fallback():
     assert "generic information panel" in prompt
 
 
-def test_template_reference_is_extra_command_image_without_changing_listing_count(tmp_path, monkeypatch):
+def test_template_reference_is_extra_app_server_image_without_changing_listing_count(tmp_path, monkeypatch):
     monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
     monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
     monkeypatch.setenv("RENDER_DATA_DIR", str(tmp_path))
@@ -166,24 +166,25 @@ def test_template_reference_is_extra_command_image_without_changing_listing_coun
         path.write_bytes(PNG)
         return path
 
-    def fake_run(command, **kwargs):
-        command_seen["command"] = command
-        command_seen["prompt"] = kwargs["input"]
-        workspace = Path(command[command.index("-C") + 1])
+    def fake_run(workspace, inputs, prompt, timeout):
+        command_seen["workspace"] = workspace
+        command_seen["inputs"] = inputs
+        command_seen["prompt"] = prompt
+        command_seen["timeout"] = timeout
         output = workspace / "rendered-output.png"
         output.write_bytes(PNG + b"out")
-        event = json.dumps({"type": "item.completed", "item": {"type": "image_generation_call"}})
-        return subprocess.CompletedProcess(command, 0, stdout=event, stderr="")
+        event = json.dumps({"method": "item/completed", "params": {"item": {"type": "imageGeneration"}}})
+        return renderer._CodexRun(0, event, "")
 
     monkeypatch.setattr(renderer, "_download_image", fake_download)
-    monkeypatch.setattr(renderer.subprocess, "run", fake_run)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", fake_run)
     request = renderer.RenderRequest.model_validate(designed_payload(template_reference_url="https://example.com/template.png"))
     data, mime, _ = renderer._render(request)
     assert data == PNG + b"out"
     assert mime == "image/png"
     assert len(request.input_urls) == 2
     assert len(downloaded) == 3
-    assert command_seen["command"].count("-i") == 3
+    assert len(command_seen["inputs"]) == 3
     assert "DESIGN REFERENCE ONLY" in command_seen["prompt"]
     assert "inspiration-only" in command_seen["prompt"]
     proof = renderer._load_fresh_proof()
@@ -197,22 +198,33 @@ def test_legacy_lifestyle_prompt_keeps_image_two_ground_truth():
     assert "preserve the room" in prompt
 
 
-def test_command_enables_image_generation(tmp_path):
-    command = renderer._codex_command(tmp_path, [tmp_path / "a.png"])
-    assert command[:2] == ["codex", "exec"]
+def test_app_server_command_enables_image_generation():
+    command = renderer._codex_app_server_command()
+    assert command[:2] == ["codex", "app-server"]
     assert command[command.index("--enable") + 1] == "image_generation"
-    assert "--ephemeral" in command
-    assert command[command.index("--sandbox") + 1] == "workspace-write"
-    assert "-c" in command
-    assert 'approval_policy="never"' in command
-    assert "--ignore-user-config" in command
-    assert command[-1] == "-"
+
+
+def test_app_server_input_has_explicit_skill_and_local_images(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    prompt = "$imagegen\nUse the image tool exactly once."
+    inputs = renderer._codex_app_server_inputs(prompt, [tmp_path / "photo.jpg", tmp_path / "art.png"])
+    assert inputs[0] == {"type": "text", "text": prompt}
+    assert inputs[1:3] == [
+        {"type": "localImage", "path": str(tmp_path / "photo.jpg")},
+        {"type": "localImage", "path": str(tmp_path / "art.png")},
+    ]
+    assert inputs[3] == {
+        "type": "skill",
+        "name": "imagegen",
+        "path": str(tmp_path / "codex-home" / "skills" / ".system" / "imagegen" / "SKILL.md"),
+    }
 
 
 def test_codex_event_summary_distinguishes_image_tool_events():
     raw = '\n'.join([
         '{"type":"thread.started"}',
         '{"type":"item.completed","item":{"type":"image_generation_call"}}',
+        '{"method":"item/completed","params":{"item":{"type":"imageGeneration"}}}',
     ])
     summary = renderer._codex_event_summary(raw)
     assert "image_generation_call" in summary
