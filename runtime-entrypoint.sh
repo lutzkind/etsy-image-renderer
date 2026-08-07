@@ -20,6 +20,10 @@ if [ "$(id -u)" -eq 0 ]; then
         cp -R /opt/codex-system-skills/imagegen "$codex_home/skills/.system/imagegen"
         chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills/.system/imagegen"
     fi
+    # app-server refreshes the system-skill tree on startup.  Its parent
+    # directories must be writable by the dropped-privilege renderer user;
+    # otherwise the refresh removes the vendored skill and fails closed.
+    chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills"
     if [ -n "$auth_source" ]; then
         test -r "$auth_source"
         cp "$auth_source" "$codex_home/auth.json"
