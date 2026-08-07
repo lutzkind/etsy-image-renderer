@@ -650,6 +650,11 @@ def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, time
         try:
             if process.stdin is not None:
                 process.stdin.close()
+                # Popen.communicate() flushes stdin before waiting.  The
+                # app-server is already being shut down here, so leave it
+                # unset after closing to prevent communicate() from flushing
+                # a closed pipe and masking a successful image generation.
+                process.stdin = None
         except OSError:
             pass
         if process.poll() is None:
