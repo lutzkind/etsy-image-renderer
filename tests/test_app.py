@@ -412,6 +412,7 @@ def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     assert 'chown -R "$runtime_uid:$runtime_gid" "$codex_home"' in entrypoint_text
     assert 'chown "$runtime_uid:0" "$codex_home"' in entrypoint_text
     assert 'chmod 0770 "$codex_home"' in entrypoint_text
+    assert 'chmod -R u+rwX "$codex_home/skills"' in entrypoint_text
     assert "codex-system-skills/imagegen" in entrypoint_text
     assert 'chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills"' in entrypoint_text
     assert "codex-system-skills/imagegen" in dockerfile_text

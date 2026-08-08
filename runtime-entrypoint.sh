@@ -22,6 +22,10 @@ if [ "$(id -u)" -eq 0 ]; then
     chmod 0770 "$codex_home"
     mkdir -p "$codex_home/skills/.system"
     if [ -d /opt/codex-system-skills/imagegen ]; then
+        # The container intentionally drops DAC_OVERRIDE. After the home is
+        # re-owned by the runtime user, root cannot remove a 0755 skill tree
+        # unless the tree itself is made writable first.
+        chmod -R u+rwX "$codex_home/skills" 2>/dev/null || true
         rm -rf "$codex_home/skills/.system/imagegen"
         cp -R /opt/codex-system-skills/imagegen "$codex_home/skills/.system/imagegen"
         chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills/.system/imagegen"
