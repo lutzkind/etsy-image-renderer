@@ -1227,7 +1227,7 @@ def render_async(request: RenderRequest, authorization: str | None = Header(defa
             _validate_public_https_url(request.template_reference_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not readiness()["ready"]:
+    if request.mode != "selector_card" and not readiness()["ready"]:
         raise HTTPException(status_code=503, detail="renderer_not_ready")
     _restore_async_state()
     _prune_async_jobs()
