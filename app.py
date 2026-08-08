@@ -834,36 +834,34 @@ def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
     lettering = _selector_options(spec, "lettering_options")
     backgrounds = _selector_options(spec, "background_options")
 
-    def draw_section(y: int, heading: str, options: list[dict[str, str]]) -> int:
+    def draw_section(x: int, y: int, heading: str, options: list[dict[str, str]], column_width: int) -> None:
         if not options:
-            return y
-        draw.text((716, y), heading, font=section_font, fill=ink)
-        y += 52
+            return
+        draw.text((x, y), heading, font=section_font, fill=ink)
+        y += 58
         for option in options:
             code = option["code"]
             label = option["label"]
-            draw.rounded_rectangle((716, y, 772, y + 48), radius=18, outline=line, width=2, fill=paper)
+            draw.rounded_rectangle((x, y, x + 58, y + 50), radius=18, outline=line, width=2, fill=paper)
             code_box = draw.textbbox((0, 0), code, font=code_font)
             code_w = code_box[2] - code_box[0]
             code_h = code_box[3] - code_box[1]
-            draw.text((744 - code_w / 2, y + 24 - code_h / 2 - 2), code, font=code_font, fill=accent)
-            draw.text((794, y + 5), label, font=label_font, fill=ink)
-            y += 62
-        return y
+            draw.text((x + 29 - code_w / 2, y + 25 - code_h / 2 - 2), code, font=code_font, fill=accent)
+            label_x = x + 78
+            max_label_width = max(120, column_width - 88)
+            label_box = draw.textbbox((0, 0), label, font=label_font)
+            fitted_font = _selector_font(27) if label_box[2] - label_box[0] > max_label_width else label_font
+            draw.text((label_x, y + 6), label, font=fitted_font, fill=ink)
+            y += 72
 
-    right_y = 218
-    right_y = draw_section(right_y, "LETTERING", lettering)
-    if lettering and backgrounds:
-        right_y += 24
-        draw.line((716, right_y, 1450, right_y), fill=line, width=2)
-        right_y += 30
-    draw_section(right_y, "BACKGROUND", backgrounds)
+    draw_section(716, 230, "LETTERING", lettering, 350)
+    draw_section(1086, 230, "BACKGROUND", backgrounds, 364)
 
     default_note = str(spec.get("default_note") or "Shown style is used if no selection is provided.").strip()
-    note_top = 902
-    draw.line((716, note_top - 22, 1450, note_top - 22), fill=line, width=2)
+    note_top = 858
+    draw.line((716, note_top - 24, 1450, note_top - 24), fill=line, width=2)
     draw.text((716, note_top), default_note, font=note_font, fill=muted)
-    draw.text((716, note_top + 42), "Choose by code; labels describe style treatments rather than exact font or colour files.", font=note_font, fill=muted)
+    draw.text((716, note_top + 43), "Choose by code; labels describe style treatments, not exact font or colour files.", font=note_font, fill=muted)
 
     output = BytesIO()
     canvas.save(output, format="PNG", optimize=True)
