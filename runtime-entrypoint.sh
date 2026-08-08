@@ -12,6 +12,12 @@ if [ "$(id -u)" -eq 0 ]; then
         auth_source=/root/.codex/auth.json
     fi
     mkdir -p "$codex_home"
+    # Codex may create its bundled skills and helper files before a restart
+    # (for example when an operator runs a read-only status command through
+    # Docker as root). Re-own the complete runtime home before dropping
+    # privileges so a later authenticated render cannot fail during Codex's
+    # own cache cleanup with a misleading permission error.
+    chown -R "$runtime_uid:$runtime_gid" "$codex_home"
     chown "$runtime_uid:0" "$codex_home"
     chmod 0770 "$codex_home"
     mkdir -p "$codex_home/skills/.system"
