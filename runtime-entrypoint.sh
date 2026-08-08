@@ -14,18 +14,16 @@ if [ "$(id -u)" -eq 0 ]; then
     mkdir -p "$codex_home"
     # Codex may create its bundled skills and helper files before a restart
     # (for example when an operator runs a read-only status command through
-    # Docker as root). Re-own the complete runtime home before dropping
-    # privileges so a later authenticated render cannot fail during Codex's
-    # own cache cleanup with a misleading permission error.
+    # Docker as root). Make an existing tree removable while this entrypoint
+    # still has its startup capabilities. Re-owning it first would leave the
+    # parent directories writable only by UID 10001; with DAC_OVERRIDE removed
+    # even root could then fail to remove stale skill files.
+    chmod -R a+rwX "$codex_home" 2>/dev/null || true
     chown -R "$runtime_uid:$runtime_gid" "$codex_home"
     chown "$runtime_uid:0" "$codex_home"
     chmod 0770 "$codex_home"
     mkdir -p "$codex_home/skills/.system"
     if [ -d /opt/codex-system-skills/imagegen ]; then
-        # The container intentionally drops DAC_OVERRIDE. After the home is
-        # re-owned by the runtime user, root cannot remove a 0755 skill tree
-        # unless the tree itself is made writable first.
-        chmod -R u+rwX "$codex_home/skills" 2>/dev/null || true
         rm -rf "$codex_home/skills/.system/imagegen"
         cp -R /opt/codex-system-skills/imagegen "$codex_home/skills/.system/imagegen"
         chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills/.system/imagegen"
