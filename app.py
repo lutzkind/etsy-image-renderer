@@ -773,6 +773,106 @@ def _release_failed_request(request_hash: str) -> None:
     with _REQUEST_DIGESTS_LOCK:
         _REQUEST_DIGESTS.pop(request_hash, None)
 
+
+def _selector_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
+    filename = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    candidates = (
+        Path("/usr/share/fonts/truetype/dejavu") / filename,
+        Path("/usr/local/share/fonts") / filename,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return ImageFont.truetype(str(candidate), size=size)
+    raise RuntimeError("selector_font_unavailable")
+
+
+def _selector_options(spec: dict[str, Any], key: str) -> list[dict[str, str]]:
+    options = spec.get(key) or []
+    return [
+        {
+            "id": str(option.get("id") or "").strip(),
+            "label": str(option.get("label") or "").strip(),
+            "code": str(option.get("code") or "").strip(),
+        }
+        for option in options
+        if isinstance(option, dict)
+    ]
+
+
+def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
+    width, height = 1536, 1024
+    background = (247, 245, 241)
+    ink = (38, 36, 33)
+    muted = (105, 101, 94)
+    line = (211, 206, 198)
+    paper = (255, 255, 255)
+    accent = (85, 80, 72)
+
+    canvas = Image.new("RGB", (width, height), background)
+    draw = ImageDraw.Draw(canvas)
+    title_font = _selector_font(64, bold=True)
+    subtitle_font = _selector_font(27)
+    section_font = _selector_font(29, bold=True)
+    label_font = _selector_font(31)
+    code_font = _selector_font(24, bold=True)
+    note_font = _selector_font(24)
+
+    draw.text((76, 58), "CHOOSE YOUR STYLE", font=title_font, fill=ink)
+    draw.text((78, 137), "Optional personalization — the shown style is used if you leave this blank.", font=subtitle_font, fill=muted)
+
+    art_box = (76, 214, 630, 882)
+    draw.rounded_rectangle((64, 202, 642, 894), radius=28, fill=(231, 227, 220))
+    draw.rounded_rectangle(art_box, radius=22, fill=paper)
+    with Image.open(artwork_path) as raw_art:
+        art = raw_art.convert("RGB")
+        fitted = ImageOps.contain(art, (art_box[2] - art_box[0] - 44, art_box[3] - art_box[1] - 44), method=Image.Resampling.LANCZOS)
+    art_x = art_box[0] + (art_box[2] - art_box[0] - fitted.width) // 2
+    art_y = art_box[1] + (art_box[3] - art_box[1] - fitted.height) // 2
+    canvas.paste(fitted, (art_x, art_y))
+    draw.text((78, 918), "Artwork preview", font=note_font, fill=muted)
+
+    lettering = _selector_options(spec, "lettering_options")
+    backgrounds = _selector_options(spec, "background_options")
+
+    def draw_section(y: int, heading: str, options: list[dict[str, str]]) -> int:
+        if not options:
+            return y
+        draw.text((716, y), heading, font=section_font, fill=ink)
+        y += 52
+        for option in options:
+            code = option["code"]
+            label = option["label"]
+            draw.rounded_rectangle((716, y, 772, y + 48), radius=18, outline=line, width=2, fill=paper)
+            code_box = draw.textbbox((0, 0), code, font=code_font)
+            code_w = code_box[2] - code_box[0]
+            code_h = code_box[3] - code_box[1]
+            draw.text((744 - code_w / 2, y + 24 - code_h / 2 - 2), code, font=code_font, fill=accent)
+            draw.text((794, y + 5), label, font=label_font, fill=ink)
+            y += 62
+        return y
+
+    right_y = 218
+    right_y = draw_section(right_y, "LETTERING", lettering)
+    if lettering and backgrounds:
+        right_y += 24
+        draw.line((716, right_y, 1450, right_y), fill=line, width=2)
+        right_y += 30
+    draw_section(right_y, "BACKGROUND", backgrounds)
+
+    default_note = str(spec.get("default_note") or "Shown style is used if no selection is provided.").strip()
+    note_top = 902
+    draw.line((716, note_top - 22, 1450, note_top - 22), fill=line, width=2)
+    draw.text((716, note_top), default_note, font=note_font, fill=muted)
+    draw.text((716, note_top + 42), "Choose by code; labels describe style treatments rather than exact font or colour files.", font=note_font, fill=muted)
+
+    output = BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    data = output.getvalue()
+    if len(data) > MAX_OUTPUT_BYTES:
+        raise RuntimeError("output_too_large")
+    return data
+
+
 def _render(request: RenderRequest) -> tuple[bytes, str, str]:
     urls = [_validate_public_https_url(url) for url in request.input_urls]
     template_url = _validate_public_https_url(request.template_reference_url) if request.template_reference_url else None
