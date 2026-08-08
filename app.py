@@ -16,11 +16,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
