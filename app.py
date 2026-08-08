@@ -445,17 +445,28 @@ def _load_fresh_proof() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _proof_pipeline_version(payload: dict[str, Any]) -> str:
+    explicit = str(payload.get("image_pipeline_version") or "").strip()
+    if explicit:
+        return explicit
+    # Backward compatibility for proofs written before image-pipeline and app
+    # versions were separated. At that time the app version represented the
+    # image-generation pipeline version as well.
+    return str(payload.get("app_version") or "").strip()
+
+
 def _record_fresh_proof(mode: str, request_hash: str, output_sha256: str, event_summary: str) -> None:
     if "image_generation_call" not in event_summary:
         return
     current = _load_fresh_proof()
     modes = current.get("modes") if (
         current.get("schema_version") == FRESH_PROOF_SCHEMA_VERSION
-        and current.get("app_version") == APP_VERSION
+        and _proof_pipeline_version(current) == IMAGE_PIPELINE_VERSION
         and isinstance(current.get("modes"), dict)
     ) else {}
     modes[str(mode)] = {
         "app_version": APP_VERSION,
+        "image_pipeline_version": IMAGE_PIPELINE_VERSION,
         "completed_at": time.time(),
         "request_hash": request_hash,
         "output_sha256": output_sha256,
@@ -464,6 +475,7 @@ def _record_fresh_proof(mode: str, request_hash: str, output_sha256: str, event_
     payload = {
         "schema_version": FRESH_PROOF_SCHEMA_VERSION,
         "app_version": APP_VERSION,
+        "image_pipeline_version": IMAGE_PIPELINE_VERSION,
         "modes": modes,
     }
     target = _fresh_proof_path()
@@ -474,12 +486,13 @@ def _record_fresh_proof(mode: str, request_hash: str, output_sha256: str, event_
 
 def _fresh_capability_status() -> dict[str, Any]:
     proof = _load_fresh_proof()
-    proof_current = proof.get("schema_version") == FRESH_PROOF_SCHEMA_VERSION and proof.get("app_version") == APP_VERSION
+    proof_pipeline_version = _proof_pipeline_version(proof)
+    proof_current = proof.get("schema_version") == FRESH_PROOF_SCHEMA_VERSION and proof_pipeline_version == IMAGE_PIPELINE_VERSION
     modes = proof.get("modes") if proof_current and isinstance(proof.get("modes"), dict) else {}
     verified_modes = sorted(
         mode for mode in REQUIRED_FRESH_MODES
         if isinstance(modes.get(mode), dict)
-        and str(modes[mode].get("app_version") or "") == APP_VERSION
+        and _proof_pipeline_version(modes[mode]) == IMAGE_PIPELINE_VERSION
         and "image_generation_call" in str(modes[mode].get("event_summary") or "")
     )
     return {
@@ -487,8 +500,10 @@ def _fresh_capability_status() -> dict[str, Any]:
         "fresh_gallery_capability_verified": set(verified_modes) == set(REQUIRED_FRESH_MODES),
         "required_fresh_modes": list(REQUIRED_FRESH_MODES),
         "verified_fresh_modes": verified_modes,
+        "image_pipeline_version": IMAGE_PIPELINE_VERSION,
         "fresh_proof_schema_version": str(proof.get("schema_version") or ""),
         "fresh_proof_app_version": str(proof.get("app_version") or ""),
+        "fresh_proof_image_pipeline_version": proof_pipeline_version,
     }
 
 
