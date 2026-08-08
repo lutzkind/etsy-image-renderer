@@ -22,15 +22,16 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 CONTRACT_VERSION = "luxlm-render-contract-v3"
 IMAGE_PIPELINE_VERSION = "1.5.0"
+SELECTOR_LAYOUT_VERSION = "etsy-selector-card-v2-editorial-dimension-specific"
 FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
@@ -169,6 +170,10 @@ class RenderRequest(BaseModel):
             default_note = str(spec.get("default_note") or "").strip()
             if not default_note:
                 raise ValueError("selector_card_requires_default_note")
+            semantic_flag = spec.get("semantic_treatments_only")
+            if semantic_flag is not True:
+                raise ValueError("selector_card_requires_semantic_treatment_flag")
+            dimension = str(spec.get("selector_dimension") or "").strip().lower()
             option_total = 0
             for key in ("lettering_options", "background_options"):
                 options = spec.get(key) or []
@@ -193,6 +198,20 @@ class RenderRequest(BaseModel):
                 option_total += len(options)
             if option_total < 1:
                 raise ValueError("selector_card_requires_options")
+            lettering_count = len(spec.get("lettering_options") or [])
+            background_count = len(spec.get("background_options") or [])
+            if dimension not in {"lettering", "background", "dual"}:
+                dimension = "dual" if lettering_count and background_count else "lettering" if lettering_count else "background"
+            if dimension == "lettering" and (not lettering_count or background_count):
+                raise ValueError("selector_card_lettering_dimension_invalid")
+            if dimension == "background" and (not background_count or lettering_count):
+                raise ValueError("selector_card_background_dimension_invalid")
+            if dimension == "dual" and (not lettering_count or not background_count):
+                raise ValueError("selector_card_dual_dimension_invalid")
+            if dimension == "lettering" and not str(spec.get("sample_text") or "").strip():
+                raise ValueError("selector_card_lettering_sample_missing")
+            if not str(spec.get("truthfulness_note") or "").strip():
+                raise ValueError("selector_card_truthfulness_note_missing")
 
         if self.mode == "decorative_asset":
             if expected is None:
@@ -802,6 +821,36 @@ def _selector_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
     raise RuntimeError("selector_font_unavailable")
 
 
+def _selector_style_font(size: int, option_id: str, *, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """Use typography as an honest visual approximation of a semantic treatment.
+
+    Fulfillment stores a semantic lettering treatment, not a guaranteed font
+    file. The selector therefore uses locally available families only to show
+    the character of each choice and explicitly says so on the card.
+    """
+    option = str(option_id or "").strip().lower()
+    if option == "listing_default":
+        filenames = ("DejaVuSerif-Bold.ttf", "DejaVuSerif.ttf") if bold else ("DejaVuSerif.ttf",)
+    elif option in {"classic_serif", "refined_serif"}:
+        filenames = ("DejaVuSerif-Bold.ttf", "DejaVuSerif.ttf")
+    elif option == "handwritten_script":
+        filenames = ("DejaVuSerif-Italic.ttf", "DejaVuSans-Oblique.ttf")
+    elif option == "soft_brush_script":
+        filenames = ("DejaVuSans-BoldOblique.ttf", "DejaVuSans-Oblique.ttf", "DejaVuSans.ttf")
+    elif option in {"editorial_small_caps", "minimal_capitals"}:
+        filenames = ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
+    elif option in {"playful_rounded", "clean_monoline", "modern_sans"}:
+        filenames = ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
+    else:
+        filenames = ("DejaVuSerif.ttf", "DejaVuSans.ttf")
+    for filename in filenames:
+        for root in (Path("/usr/share/fonts/truetype/dejavu"), Path("/usr/local/share/fonts")):
+            candidate = root / filename
+            if candidate.is_file():
+                return ImageFont.truetype(str(candidate), size=size)
+    return _selector_font(size, bold=bold)
+
+
 def _selector_options(spec: dict[str, Any], key: str) -> list[dict[str, str]]:
     options = spec.get(key) or []
     return [
@@ -815,72 +864,172 @@ def _selector_options(spec: dict[str, Any], key: str) -> list[dict[str, str]]:
     ]
 
 
-def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
-    width, height = 1536, 1024
-    background = (247, 245, 241)
-    ink = (38, 36, 33)
-    muted = (105, 101, 94)
-    line = (211, 206, 198)
-    paper = (255, 255, 255)
-    accent = (85, 80, 72)
+def _selector_dimension(spec: dict[str, Any]) -> str:
+    explicit = str(spec.get("selector_dimension") or "").strip().lower()
+    if explicit in {"lettering", "background", "dual"}:
+        return explicit
+    lettering = bool(spec.get("lettering_options"))
+    backgrounds = bool(spec.get("background_options"))
+    return "dual" if lettering and backgrounds else "lettering" if lettering else "background"
 
-    canvas = Image.new("RGB", (width, height), background)
+
+def _selector_fit_font(text: str, size: int, max_width: int, option_id: str, *, bold: bool = False) -> ImageFont.FreeTypeFont:
+    for candidate_size in range(size, 18, -2):
+        font = _selector_style_font(candidate_size, option_id, bold=bold)
+        box = font.getbbox(str(text))
+        if box[2] - box[0] <= max_width:
+            return font
+    return _selector_style_font(18, option_id, bold=bold)
+
+
+def _selector_title_font(size: int = 62) -> ImageFont.FreeTypeFont:
+    for filename in ("DejaVuSerif.ttf", "DejaVuSerif-Bold.ttf"):
+        for root in (Path("/usr/share/fonts/truetype/dejavu"), Path("/usr/local/share/fonts")):
+            candidate = root / filename
+            if candidate.is_file():
+                return ImageFont.truetype(str(candidate), size=size)
+    return _selector_font(size, bold=True)
+
+
+def _selector_draw_wash(canvas: Image.Image, box: tuple[int, int, int, int], color: tuple[int, int, int], *, alpha: int = 95) -> None:
+    left, top, right, bottom = box
+    wash = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(wash)
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    draw.ellipse((left - width // 5, top - height // 3, right + width // 7, bottom + height // 3), fill=(*color, alpha))
+    draw.ellipse((left + width // 5, top - height // 5, right + width // 3, bottom + height // 2), fill=(*color, max(25, alpha // 2)))
+    wash = wash.filter(ImageFilter.GaussianBlur(max(12, min(width, height) // 7)))
+    canvas.alpha_composite(wash)
+
+
+def _selector_artwork_anchor(canvas: Image.Image, artwork_path: Path, box: tuple[int, int, int, int]) -> None:
     draw = ImageDraw.Draw(canvas)
-    title_font = _selector_font(64, bold=True)
-    subtitle_font = _selector_font(27)
-    section_font = _selector_font(29, bold=True)
-    label_font = _selector_font(31)
-    code_font = _selector_font(24, bold=True)
-    note_font = _selector_font(24)
-
-    draw.text((76, 58), "CHOOSE YOUR STYLE", font=title_font, fill=ink)
-    draw.text((78, 137), "Optional personalization — the shown style is used if you leave this blank.", font=subtitle_font, fill=muted)
-
-    art_box = (76, 214, 630, 882)
-    draw.rounded_rectangle((64, 202, 642, 894), radius=28, fill=(231, 227, 220))
-    draw.rounded_rectangle(art_box, radius=22, fill=paper)
+    left, top, right, bottom = box
+    draw.rounded_rectangle((left - 14, top - 14, right + 14, bottom + 14), radius=34, fill=(238, 231, 219, 255))
+    draw.rounded_rectangle(box, radius=26, fill=(255, 253, 247, 255), outline=(226, 217, 204, 255), width=3)
     with Image.open(artwork_path) as raw_art:
         art = raw_art.convert("RGB")
-        fitted = ImageOps.contain(art, (art_box[2] - art_box[0] - 44, art_box[3] - art_box[1] - 44), method=Image.Resampling.LANCZOS)
-    art_x = art_box[0] + (art_box[2] - art_box[0] - fitted.width) // 2
-    art_y = art_box[1] + (art_box[3] - art_box[1] - fitted.height) // 2
-    canvas.paste(fitted, (art_x, art_y))
-    draw.text((78, 918), "Artwork preview", font=note_font, fill=muted)
+        fitted = ImageOps.contain(art, (right - left - 38, bottom - top - 38), method=Image.Resampling.LANCZOS)
+    art_x = left + (right - left - fitted.width) // 2
+    art_y = top + (bottom - top - fitted.height) // 2
+    canvas.paste(fitted.convert("RGBA"), (art_x, art_y))
+
+
+def _selector_footer(canvas: Image.Image, spec: dict[str, Any], y: int) -> None:
+    draw = ImageDraw.Draw(canvas)
+    line = (218, 209, 197, 255)
+    muted = (92, 91, 87, 255)
+    draw.line((720, y - 22, 1450, y - 22), fill=line, width=2)
+    note_font = _selector_font(23)
+    truth_font = _selector_font(21)
+    default_note = str(spec.get("default_note") or "Optional — leave blank to use the shown style.").strip()
+    truthfulness = str(spec.get("truthfulness_note") or "Preview shows the style character; final treatment remains semantic.").strip()
+    draw.text((720, y), default_note, font=note_font, fill=muted)
+    draw.text((720, y + 38), truthfulness, font=truth_font, fill=muted)
+
+
+def _background_preview_color(option: dict[str, str]) -> tuple[int, int, int]:
+    palette = {
+        "listing_default": (237, 229, 210),
+        "warm_neutral": (218, 190, 154),
+        "blush_wash": (224, 174, 178),
+        "cool_neutral": (178, 202, 210),
+        "soft_colour_wash": (190, 207, 181),
+        "sage_wash": (165, 191, 157),
+        "blue_grey_wash": (157, 181, 195),
+        "cream_paper": (237, 224, 193),
+        "clean_white": (246, 246, 240),
+        "muted_ochre": (205, 179, 116),
+    }
+    option_id = str(option.get("id") or "").strip().lower()
+    if option_id in palette:
+        return palette[option_id]
+    digest = hashlib.sha256(option_id.encode("utf-8")).digest()
+    return tuple(145 + int(value) % 90 for value in digest[:3])
+
+
+def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
+    width, height = 1536, 1024
+    dimension = _selector_dimension(spec)
+    paper = (248, 244, 235, 255)
+    ink = (31, 53, 76, 255)
+    muted = (88, 92, 90, 255)
+    accent = (203, 132, 116, 255)
+    sage = (153, 174, 137, 255)
+    canvas = Image.new("RGBA", (width, height), paper)
+    _selector_draw_wash(canvas, (30, 40, 720, 970), (226, 215, 182), alpha=40)
+    _selector_draw_wash(canvas, (720, 30, 1500, 960), (214, 224, 201), alpha=28)
+    draw = ImageDraw.Draw(canvas)
+    title_font = _selector_title_font(62)
+    subtitle_font = _selector_font(27)
+    label_font = _selector_font(24)
+    code_font = _selector_font(22, bold=True)
+    title = str(spec.get("title") or ("Choose Your Lettering" if dimension == "lettering" else "Choose Your Background" if dimension == "background" else "Choose Your Style")).strip()
+    subtitle = str(spec.get("subtitle") or ("Compare the lettering character for names, dates or a short phrase." if dimension == "lettering" else "Compare the background mood behind your finished artwork.")).strip()
+    draw.text((78, 54), title, font=title_font, fill=ink)
+    draw.text((82, 137), subtitle, font=subtitle_font, fill=muted)
+
+    art_box = (82, 220, 640, 848)
+    _selector_artwork_anchor(canvas, artwork_path, art_box)
+    draw.text((86, 875), str(spec.get("anchor_label") or "Listing artwork"), font=label_font, fill=muted)
 
     lettering = _selector_options(spec, "lettering_options")
     backgrounds = _selector_options(spec, "background_options")
+    row_x, row_top, row_width, row_height = 720, 218, 730, 116
 
-    def draw_section(x: int, y: int, heading: str, options: list[dict[str, str]], column_width: int) -> None:
-        if not options:
-            return
-        draw.text((x, y), heading, font=section_font, fill=ink)
-        y += 58
-        for option in options:
+    if dimension == "lettering":
+        draw.text((row_x, 214), "LETTERING STYLE", font=_selector_font(25, bold=True), fill=ink)
+        sample = str(spec.get("sample_text") or "Your names").strip()
+        for index, option in enumerate(lettering):
+            top = row_top + 45 + index * row_height
+            fill = (250, 246, 238, 235) if index == 0 else (253, 249, 242, 185)
+            draw.rounded_rectangle((row_x, top, row_x + row_width, top + 94), radius=22, fill=fill, outline=(224, 215, 203, 210), width=2)
+            _selector_draw_wash(canvas, (row_x + 24, top + 18, row_x + 66, top + 76), (203, 132, 116) if index % 2 == 0 else (153, 174, 137), alpha=105)
             code = option["code"]
-            label = option["label"]
-            draw.rounded_rectangle((x, y, x + 58, y + 50), radius=18, outline=line, width=2, fill=paper)
+            draw.ellipse((row_x + 22, top + 23, row_x + 68, top + 69), fill=(31, 53, 76, 245))
             code_box = draw.textbbox((0, 0), code, font=code_font)
-            code_w = code_box[2] - code_box[0]
-            code_h = code_box[3] - code_box[1]
-            draw.text((x + 29 - code_w / 2, y + 25 - code_h / 2 - 2), code, font=code_font, fill=accent)
-            label_x = x + 78
-            max_label_width = max(120, column_width - 88)
+            draw.text((row_x + 45 - (code_box[2] - code_box[0]) / 2, top + 45 - (code_box[3] - code_box[1]) / 2 - 2), code, font=code_font, fill=(255, 252, 245, 255))
+            sample_font = _selector_fit_font(sample, 43, 390, option["id"])
+            draw.text((row_x + 92, top + 12), sample, font=sample_font, fill=ink)
+            label = option["label"]
             label_box = draw.textbbox((0, 0), label, font=label_font)
-            fitted_font = _selector_font(27) if label_box[2] - label_box[0] > max_label_width else label_font
-            draw.text((label_x, y + 6), label, font=fitted_font, fill=ink)
-            y += 72
+            draw.text((row_x + 92, top + 65), label, font=label_font, fill=muted)
+            if index == 0:
+                shown_font = _selector_font(18, bold=True)
+                draw.text((row_x + row_width - 115, top + 68), "SHOWN", font=shown_font, fill=(166, 111, 98, 255))
+    elif dimension == "background":
+        draw.text((row_x, 214), "BACKGROUND MOOD", font=_selector_font(25, bold=True), fill=ink)
+        for index, option in enumerate(backgrounds):
+            top = row_top + 45 + index * row_height
+            color = _background_preview_color(option)
+            draw.rounded_rectangle((row_x, top, row_x + row_width, top + 94), radius=22, fill=(253, 249, 242, 185), outline=(224, 215, 203, 210), width=2)
+            swatch = (row_x + 22, top + 19, row_x + 188, top + 75)
+            draw.rounded_rectangle(swatch, radius=28, fill=(*color, 180))
+            _selector_draw_wash(canvas, swatch, color, alpha=110)
+            draw.rounded_rectangle((row_x + 22, top + 19, row_x + 188, top + 75), radius=28, outline=(255, 252, 245, 220), width=2)
+            code = option["code"]
+            code_box = draw.textbbox((0, 0), code, font=code_font)
+            draw.text((row_x + 105 - (code_box[2] - code_box[0]) / 2, top + 47 - (code_box[3] - code_box[1]) / 2 - 2), code, font=code_font, fill=ink)
+            draw.text((row_x + 220, top + 20), option["label"], font=_selector_font(29), fill=ink)
+            draw.text((row_x + 220, top + 59), "watercolour mood preview", font=_selector_font(19), fill=muted)
+            if index == 0:
+                draw.text((row_x + row_width - 115, top + 68), "SHOWN", font=_selector_font(18, bold=True), fill=(166, 111, 98, 255))
+    else:
+        # Retain a bounded legacy rendering path for old callers. The live
+        # gallery-builder never selects this combined presentation anymore.
+        draw.text((row_x, 214), "STYLE OPTIONS", font=_selector_font(25, bold=True), fill=ink)
+        options = lettering + backgrounds
+        for index, option in enumerate(options[:5]):
+            top = row_top + 45 + index * row_height
+            draw.rounded_rectangle((row_x, top, row_x + row_width, top + 94), radius=22, fill=(253, 249, 242, 185), outline=(224, 215, 203, 210), width=2)
+            draw.text((row_x + 35, top + 25), option["code"], font=code_font, fill=ink)
+            draw.text((row_x + 112, top + 23), option["label"], font=_selector_font(29), fill=ink)
 
-    draw_section(716, 230, "LETTERING", lettering, 350)
-    draw_section(1086, 230, "BACKGROUND", backgrounds, 364)
-
-    default_note = str(spec.get("default_note") or "Shown style is used if no selection is provided.").strip()
-    note_top = 858
-    draw.line((716, note_top - 24, 1450, note_top - 24), fill=line, width=2)
-    draw.text((716, note_top), default_note, font=note_font, fill=muted)
-    draw.text((716, note_top + 43), "Choose by code; labels describe style treatments, not exact font or colour files.", font=note_font, fill=muted)
+    _selector_footer(canvas, spec, 874)
 
     output = BytesIO()
-    canvas.save(output, format="PNG", optimize=True)
+    canvas.convert("RGB").save(output, format="PNG", optimize=True)
     data = output.getvalue()
     if len(data) > MAX_OUTPUT_BYTES:
         raise RuntimeError("output_too_large")

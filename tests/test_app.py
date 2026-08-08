@@ -68,8 +68,12 @@ def selector_payload(**overrides):
         "card_brief": {
             "headline": "Choose Your Style",
             "selector_spec": {
+                "selector_dimension": "dual",
                 "selection_optional": True,
+                "semantic_treatments_only": True,
+                "sample_text": "Alex + Sam",
                 "default_note": "Leave blank to use the shown style.",
+                "truthfulness_note": "Previews show style character, not exact font files or colour formulas.",
                 "lettering_options": [
                     {"id": "listing_default", "code": "01", "label": "Shown lettering"},
                     {"id": "handwritten_script", "code": "02", "label": "Handwritten script"},
@@ -98,7 +102,7 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.6.0"
+    assert renderer.APP_VERSION == "1.7.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
         "before_after_card": 2, "information_card": 2, "selector_card": 1,
@@ -180,6 +184,26 @@ def test_selector_card_contract_is_strict_and_capability_complete():
     required["card_brief"]["selector_spec"]["selection_optional"] = False
     with pytest.raises((ValueError, ValidationError), match="selector_card_requires_optional_selection"):
         renderer.RenderRequest.model_validate(required)
+
+
+@pytest.mark.parametrize(
+    ("module", "template", "dimension", "empty_key"),
+    [
+        ("font_palette", "font_selector_editorial_v2", "lettering", "background_options"),
+        ("background_palette", "background_selector_editorial_v2", "background", "lettering_options"),
+    ],
+)
+def test_selector_card_supports_dimension_specific_editorial_contract(module, template, dimension, empty_key):
+    payload = selector_payload(module=module, template_family=template)
+    payload["card_brief"]["selector_spec"]["selector_dimension"] = dimension
+    payload["card_brief"]["selector_spec"][empty_key] = []
+    request = renderer.RenderRequest.model_validate(payload)
+    assert request.card_brief["selector_spec"]["selector_dimension"] == dimension
+
+    invalid = selector_payload(module=module, template_family=template)
+    invalid["card_brief"]["selector_spec"]["selector_dimension"] = dimension
+    with pytest.raises((ValueError, ValidationError), match="selector_card_.*dimension_invalid"):
+        renderer.RenderRequest.model_validate(invalid)
 
 
 def test_selector_card_renders_png_without_codex(tmp_path, monkeypatch):
@@ -311,7 +335,7 @@ def test_fresh_capability_status_requires_current_generation_proofs(tmp_path, mo
     assert initial["fresh_render_verified"] is False
     assert initial["fresh_gallery_capability_verified"] is False
 
-    # Legacy proof from renderer 1.5.0 remains valid after the 1.6.0 app-only
+    # Legacy proof from renderer 1.5.0 remains valid after the 1.7.0 app-only
     # selector change because the Codex image-generation pipeline did not change.
     proof = {
         "schema_version": renderer.FRESH_PROOF_SCHEMA_VERSION,
