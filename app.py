@@ -155,6 +155,44 @@ class RenderRequest(BaseModel):
                     raise ValueError("asset_roles_must_match_input_urls")
                 self.input_urls = role_urls
 
+        if self.mode == "selector_card":
+            spec = self.card_brief.get("selector_spec") if isinstance(self.card_brief, dict) else None
+            if not isinstance(spec, dict):
+                raise ValueError("selector_card_requires_selector_spec")
+            if len(self.input_urls) != 1:
+                raise ValueError("selector_card_requires_one_artwork")
+            if len(self.asset_roles) != 1 or self.asset_roles[0].role != "artwork_anchor":
+                raise ValueError("selector_card_requires_artwork_anchor")
+            if not bool(spec.get("selection_optional")):
+                raise ValueError("selector_card_requires_optional_selection")
+            default_note = str(spec.get("default_note") or "").strip()
+            if not default_note:
+                raise ValueError("selector_card_requires_default_note")
+            option_total = 0
+            for key in ("lettering_options", "background_options"):
+                options = spec.get(key) or []
+                if not isinstance(options, list) or len(options) > 5:
+                    raise ValueError("selector_card_invalid_options")
+                ids: list[str] = []
+                labels: list[str] = []
+                codes: list[str] = []
+                for option in options:
+                    if not isinstance(option, dict):
+                        raise ValueError("selector_card_invalid_option")
+                    option_id = str(option.get("id") or "").strip()
+                    label = str(option.get("label") or "").strip()
+                    code = str(option.get("code") or "").strip()
+                    if not option_id or not label or not code:
+                        raise ValueError("selector_card_option_fields_required")
+                    ids.append(option_id)
+                    labels.append(label)
+                    codes.append(code)
+                if len(ids) != len(set(ids)) or len(labels) != len(set(labels)) or len(codes) != len(set(codes)):
+                    raise ValueError("selector_card_duplicate_option")
+                option_total += len(options)
+            if option_total < 1:
+                raise ValueError("selector_card_requires_options")
+
         if self.mode == "decorative_asset":
             if expected is None:
                 expected = len(self.input_urls)
