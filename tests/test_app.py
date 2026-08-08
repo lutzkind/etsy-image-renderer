@@ -55,6 +55,42 @@ def designed_payload(**overrides):
     return payload
 
 
+def selector_payload(**overrides):
+    payload = {
+        "mode": "selector_card",
+        "input_urls": ["https://example.com/artwork.png"],
+        "expected_input_count": 1,
+        "module": "dual_selector",
+        "template_family": "dual_selector_v1",
+        "asset_roles": [
+            {"role": "artwork_anchor", "url": "https://example.com/artwork.png", "preservation": "exact_artwork", "exact_pixel_preservation": True, "transform_allowed": False},
+        ],
+        "card_brief": {
+            "headline": "Choose Your Style",
+            "selector_spec": {
+                "selection_optional": True,
+                "default_note": "Leave blank to use the shown style.",
+                "lettering_options": [
+                    {"id": "listing_default", "code": "01", "label": "Shown lettering"},
+                    {"id": "handwritten_script", "code": "02", "label": "Handwritten script"},
+                    {"id": "classic_serif", "code": "03", "label": "Classic serif"},
+                    {"id": "modern_sans", "code": "04", "label": "Modern sans"},
+                    {"id": "soft_brush_script", "code": "05", "label": "Soft brush script"},
+                ],
+                "background_options": [
+                    {"id": "listing_default", "code": "A", "label": "Shown background"},
+                    {"id": "warm_neutral", "code": "B", "label": "Warm neutral"},
+                    {"id": "blush_wash", "code": "C", "label": "Blush wash"},
+                    {"id": "cool_neutral", "code": "D", "label": "Cool neutral"},
+                    {"id": "soft_colour_wash", "code": "E", "label": "Soft colour wash"},
+                ],
+            },
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_private_urls_are_rejected(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))])
     with pytest.raises(ValueError, match="input_url_not_public"):
