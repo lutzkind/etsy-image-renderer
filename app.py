@@ -880,7 +880,7 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
     async_context = bool(getattr(_ASYNC_RENDER_CONTEXT, "active", False))
     if not async_context:
         _claim_request(request_hash)
-    if not readiness()["ready"]:
+    if request.mode != "selector_card" and not readiness()["ready"]:
         if not async_context:
             _release_failed_request(request_hash)
         raise RuntimeError("renderer_not_ready")
