@@ -62,10 +62,10 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.5.0"
+    assert renderer.APP_VERSION == "1.6.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
-        "before_after_card": 2, "information_card": 2,
+        "before_after_card": 2, "information_card": 2, "selector_card": 1,
     }
     request = renderer.RenderRequest(
         mode="decorative_asset", expected_input_count=2,
