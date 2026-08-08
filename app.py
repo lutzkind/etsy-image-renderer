@@ -28,8 +28,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.5.0"
-CONTRACT_VERSION = "luxlm-render-contract-v2"
+APP_VERSION = "1.6.0"
+CONTRACT_VERSION = "luxlm-render-contract-v3"
 FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
