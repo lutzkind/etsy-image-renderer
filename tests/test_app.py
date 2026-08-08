@@ -162,6 +162,42 @@ def test_designed_card_valid_contract():
     assert renderer._role_contract(request)["generated_text"] is True
 
 
+def test_selector_card_contract_is_strict_and_capability_complete():
+    request = renderer.RenderRequest.model_validate(selector_payload())
+    spec = request.card_brief["selector_spec"]
+    assert request.mode == "selector_card"
+    assert len(spec["lettering_options"]) == 5
+    assert len(spec["background_options"]) == 5
+    assert request.asset_roles[0].role == "artwork_anchor"
+    assert renderer._role_contract(request)["generated_text"] is True
+
+    duplicate = selector_payload()
+    duplicate["card_brief"]["selector_spec"]["lettering_options"][1]["code"] = "01"
+    with pytest.raises((ValueError, ValidationError), match="selector_card_duplicate_option"):
+        renderer.RenderRequest.model_validate(duplicate)
+
+    required = selector_payload()
+    required["card_brief"]["selector_spec"]["selection_optional"] = False
+    with pytest.raises((ValueError, ValidationError), match="selector_card_requires_optional_selection"):
+        renderer.RenderRequest.model_validate(required)
+
+
+def test_selector_card_renders_png_without_codex(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": False})
+    monkeypatch.setattr(renderer, "_selector_font", lambda size, bold=False: renderer.ImageFont.load_default(size=size))
+    monkeypatch.setattr(renderer, "_run_codex_app_server", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("codex_must_not_run")))
+    artwork = tmp_path / "artwork.png"
+    renderer.Image.new("RGB", (800, 1000), (230, 220, 210)).save(artwork, format="PNG")
+    monkeypatch.setattr(renderer, "_download_image", lambda url, target: artwork)
+
+    request = renderer.RenderRequest.model_validate(selector_payload())
+    data, mime, digest = renderer._render(request)
+    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    assert mime == "image/png"
+    assert len(digest) == 64
+
+
 def test_designed_card_prompt_contains_exact_contract_and_rejects_generic_styling():
     request = renderer.RenderRequest.model_validate(designed_payload(template_reference_url="https://example.com/template.png"))
     prompt = renderer._prompt(request)
