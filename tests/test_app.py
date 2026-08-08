@@ -311,11 +311,13 @@ def test_fresh_capability_status_requires_current_generation_proofs(tmp_path, mo
     assert initial["fresh_render_verified"] is False
     assert initial["fresh_gallery_capability_verified"] is False
 
+    # Legacy proof from renderer 1.5.0 remains valid after the 1.6.0 app-only
+    # selector change because the Codex image-generation pipeline did not change.
     proof = {
         "schema_version": renderer.FRESH_PROOF_SCHEMA_VERSION,
-        "app_version": renderer.APP_VERSION,
+        "app_version": renderer.IMAGE_PIPELINE_VERSION,
         "modes": {
-            mode: {"app_version": renderer.APP_VERSION, "event_summary": "item.completed;items=image_generation_call"}
+            mode: {"app_version": renderer.IMAGE_PIPELINE_VERSION, "event_summary": "item.completed;items=image_generation_call"}
             for mode in renderer.REQUIRED_FRESH_MODES
         },
     }
@@ -324,6 +326,15 @@ def test_fresh_capability_status_requires_current_generation_proofs(tmp_path, mo
     assert verified["fresh_render_verified"] is True
     assert verified["fresh_gallery_capability_verified"] is True
     assert verified["verified_fresh_modes"] == sorted(renderer.REQUIRED_FRESH_MODES)
+    assert verified["image_pipeline_version"] == renderer.IMAGE_PIPELINE_VERSION
+    assert verified["fresh_proof_image_pipeline_version"] == renderer.IMAGE_PIPELINE_VERSION
+
+    proof["image_pipeline_version"] = "changed-image-pipeline"
+    renderer._fresh_proof_path().write_text(json.dumps(proof), encoding="utf-8")
+    stale = renderer._fresh_capability_status()
+    assert stale["fresh_render_verified"] is False
+    assert stale["fresh_gallery_capability_verified"] is False
+    assert stale["verified_fresh_modes"] == []
 
 
 def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
