@@ -900,6 +900,14 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
         with tempfile.TemporaryDirectory(prefix="render-", dir=root) as temp:
             workspace = Path(temp)
             inputs = [_download_image(url, workspace / f"input-{index}") for index, url in enumerate(urls, 1)]
+            if request.mode == "selector_card":
+                selector_spec = request.card_brief.get("selector_spec") if isinstance(request.card_brief, dict) else {}
+                data = _render_selector_card(inputs[0], selector_spec)
+                digest = hashlib.sha256(data).hexdigest()
+                with _REQUEST_DIGESTS_LOCK:
+                    if request_hash in _REQUEST_DIGESTS:
+                        _REQUEST_DIGESTS[request_hash].update({"status": "succeeded", "output_sha256": digest})
+                return data, "image/png", digest
             reference = None
             if template_url:
                 reference = _download_image(template_url, workspace / "design-reference")
