@@ -55,39 +55,50 @@ def designed_payload(**overrides):
     return payload
 
 
-def selector_payload(**overrides):
+def designed_selector_payload(dimension="lettering", **overrides):
+    lettering = [
+        {"id": "romantic_signature", "label": "Romantic signature", "is_handwritten": True, "treatment_family": "signature"},
+        {"id": "elegant_script", "label": "Elegant script", "is_handwritten": True, "treatment_family": "script"},
+        {"id": "soft_brush_script", "label": "Soft brush script", "is_handwritten": True, "treatment_family": "brush"},
+        {"id": "delicate_calligraphy", "label": "Delicate calligraphy", "is_handwritten": True, "treatment_family": "calligraphy"},
+        {"id": "warm_handwritten", "label": "Warm handwritten", "is_handwritten": True, "treatment_family": "handwritten"},
+    ]
+    backgrounds = [
+        {"id": "warm_beige", "label": "Warm Beige", "colour_name": "Warm Beige", "preview_prompt": "warm beige artwork treatment"},
+        {"id": "blush_pink", "label": "Blush Pink", "colour_name": "Blush Pink", "preview_prompt": "blush pink artwork treatment"},
+        {"id": "sage_green", "label": "Sage Green", "colour_name": "Sage Green", "preview_prompt": "sage green artwork treatment"},
+        {"id": "dusty_blue", "label": "Dusty Blue", "colour_name": "Dusty Blue", "preview_prompt": "dusty blue artwork treatment"},
+        {"id": "soft_grey", "label": "Soft Grey", "colour_name": "Soft Grey", "preview_prompt": "soft grey artwork treatment"},
+    ]
+    active = lettering if dimension == "lettering" else backgrounds
     payload = {
-        "mode": "selector_card",
+        "mode": "designed_card",
         "input_urls": ["https://example.com/artwork.png"],
         "expected_input_count": 1,
-        "module": "dual_selector",
-        "template_family": "dual_selector_v1",
+        "module": "font_palette" if dimension == "lettering" else "background_palette",
+        "template_family": "font_selector_image2_v1" if dimension == "lettering" else "background_selector_image2_v1",
         "asset_roles": [
             {"role": "artwork_anchor", "url": "https://example.com/artwork.png", "preservation": "exact_artwork", "exact_pixel_preservation": True, "transform_allowed": False},
         ],
+        "listing_assets": [{"role": "artwork_anchor"}],
+        "prohibited_elements": sorted(renderer.DESIGNED_CARD_PROHIBITIONS),
         "card_brief": {
-            "headline": "Choose Your Style",
+            "headline": "Choose Your Handwritten Font" if dimension == "lettering" else "Choose Your Background Colour",
+            "body": "",
+            "bullets": ["Optional choice", "Artist discretion"],
             "selector_spec": {
-                "selector_dimension": "dual",
+                "selector_dimension": dimension,
                 "selection_optional": True,
+                "artist_discretion_when_omitted": True,
+                "workflow_uses_default_when_omitted": False,
+                "default_font_option_id": "",
+                "default_background_option_id": "",
                 "semantic_treatments_only": True,
-                "sample_text": "Alex + Sam",
-                "default_note": "Leave blank to use the shown style.",
-                "truthfulness_note": "Previews show style character, not exact font files or colour formulas.",
-                "lettering_options": [
-                    {"id": "listing_default", "code": "01", "label": "Shown lettering"},
-                    {"id": "handwritten_script", "code": "02", "label": "Handwritten script"},
-                    {"id": "classic_serif", "code": "03", "label": "Classic serif"},
-                    {"id": "modern_sans", "code": "04", "label": "Modern sans"},
-                    {"id": "soft_brush_script", "code": "05", "label": "Soft brush script"},
-                ],
-                "background_options": [
-                    {"id": "listing_default", "code": "A", "label": "Shown background"},
-                    {"id": "warm_neutral", "code": "B", "label": "Warm neutral"},
-                    {"id": "blush_wash", "code": "C", "label": "Blush wash"},
-                    {"id": "cool_neutral", "code": "D", "label": "Cool neutral"},
-                    {"id": "soft_colour_wash", "code": "E", "label": "Soft colour wash"},
-                ],
+                "sample_text": "Alex + Sam" if dimension == "lettering" else "",
+                "default_note": "Optional — leave blank and we'll choose what suits your artwork best.",
+                "truthfulness_note": "Preview shows semantic character, not exact font files or exact colour formulas.",
+                "lettering_options": active if dimension == "lettering" else [],
+                "background_options": active if dimension == "background" else [],
             },
         },
     }
@@ -102,11 +113,13 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.8.0"
+    assert renderer.APP_VERSION == "1.9.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
-        "before_after_card": 2, "information_card": 2, "selector_card": 1,
+        "before_after_card": 2, "information_card": 2,
     }
+    with pytest.raises((ValueError, ValidationError), match="invalid_render_mode"):
+        renderer.RenderRequest(mode="selector_card")
     request = renderer.RenderRequest(
         mode="decorative_asset", expected_input_count=2,
         asset_roles=[
@@ -164,25 +177,33 @@ def test_designed_card_valid_contract():
     assert request.expected_input_count == 2
     assert len(request.listing_assets) == 2
     assert renderer._role_contract(request)["generated_text"] is True
+    empty_selector = designed_payload()
+    empty_selector["card_brief"]["selector_spec"] = {}
+    assert renderer.RenderRequest.model_validate(empty_selector).module == "listing_gallery"
 
 
-def test_selector_card_contract_is_strict_and_capability_complete():
-    request = renderer.RenderRequest.model_validate(selector_payload())
+def test_selector_cards_use_designed_card_contract_and_codex_prompt():
+    request = renderer.RenderRequest.model_validate(designed_selector_payload())
     spec = request.card_brief["selector_spec"]
-    assert request.mode == "selector_card"
+    assert request.mode == "designed_card"
+    assert request.module == "font_palette"
     assert len(spec["lettering_options"]) == 5
-    assert len(spec["background_options"]) == 5
+    assert spec["background_options"] == []
     assert request.asset_roles[0].role == "artwork_anchor"
     assert renderer._role_contract(request)["generated_text"] is True
+    prompt = renderer._prompt(request)
+    for value in ["Romantic signature", "Elegant script", "Soft brush script", "Delicate calligraphy", "Warm handwritten", "artist chooses", "image_gen/image_generation tool exactly once"]:
+        assert value in prompt
+    assert "exact font-file fidelity" in prompt
 
-    duplicate = selector_payload()
-    duplicate["card_brief"]["selector_spec"]["lettering_options"][1]["code"] = "01"
-    with pytest.raises((ValueError, ValidationError), match="selector_card_duplicate_option"):
+    duplicate = designed_selector_payload()
+    duplicate["card_brief"]["selector_spec"]["lettering_options"][1]["id"] = "romantic_signature"
+    with pytest.raises((ValueError, ValidationError), match="designed_card_selector_duplicate_option"):
         renderer.RenderRequest.model_validate(duplicate)
 
-    required = selector_payload()
-    required["card_brief"]["selector_spec"]["selection_optional"] = False
-    with pytest.raises((ValueError, ValidationError), match="selector_card_requires_optional_selection"):
+    required = designed_selector_payload()
+    required["card_brief"]["selector_spec"]["workflow_uses_default_when_omitted"] = True
+    with pytest.raises((ValueError, ValidationError), match="designed_card_selector_default_forbidden"):
         renderer.RenderRequest.model_validate(required)
 
 
@@ -194,32 +215,42 @@ def test_selector_card_contract_is_strict_and_capability_complete():
     ],
 )
 def test_selector_card_supports_dimension_specific_editorial_contract(module, template, dimension, empty_key):
-    payload = selector_payload(module=module, template_family=template)
-    payload["card_brief"]["selector_spec"]["selector_dimension"] = dimension
-    payload["card_brief"]["selector_spec"][empty_key] = []
+    payload = designed_selector_payload(dimension, template_family=template)
     request = renderer.RenderRequest.model_validate(payload)
     assert request.card_brief["selector_spec"]["selector_dimension"] == dimension
 
-    invalid = selector_payload(module=module, template_family=template)
+    invalid = designed_selector_payload(dimension, template_family=template)
     invalid["card_brief"]["selector_spec"]["selector_dimension"] = dimension
-    with pytest.raises((ValueError, ValidationError), match="selector_card_.*dimension_invalid"):
+    invalid["card_brief"]["selector_spec"][empty_key] = [{"id": "wrong", "label": "Wrong"}]
+    with pytest.raises((ValueError, ValidationError), match="designed_card_selector_options_invalid"):
         renderer.RenderRequest.model_validate(invalid)
 
 
-def test_selector_card_renders_png_without_codex(tmp_path, monkeypatch):
+def test_selector_card_requires_codex_and_does_not_use_local_compositor(tmp_path, monkeypatch):
     monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
-    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": False})
-    monkeypatch.setattr(renderer, "_selector_font", lambda size, bold=False: renderer.ImageFont.load_default(size=size))
-    monkeypatch.setattr(renderer, "_run_codex_app_server", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("codex_must_not_run")))
-    artwork = tmp_path / "artwork.png"
-    renderer.Image.new("RGB", (800, 1000), (230, 220, 210)).save(artwork, format="PNG")
-    monkeypatch.setattr(renderer, "_download_image", lambda url, target: artwork)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    called = {}
 
-    request = renderer.RenderRequest.model_validate(selector_payload())
+    def fake_download(url, target):
+        target.with_suffix(".png").write_bytes(PNG)
+        return target.with_suffix(".png")
+
+    def fake_run(workspace, inputs, prompt, timeout):
+        called["prompt"] = prompt
+        output = workspace / "rendered-output.png"
+        output.write_bytes(PNG + b"out")
+        event = json.dumps({"method": "item/completed", "params": {"item": {"type": "imageGeneration"}}})
+        return renderer._CodexRun(0, event, "")
+
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", fake_run)
+
+    request = renderer.RenderRequest.model_validate(designed_selector_payload())
     data, mime, digest = renderer._render(request)
-    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    assert data == PNG + b"out"
     assert mime == "image/png"
     assert len(digest) == 64
+    assert "image_gen/image_generation tool exactly once" in called["prompt"]
 
 
 def test_designed_card_prompt_contains_exact_contract_and_rejects_generic_styling():

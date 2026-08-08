@@ -16,22 +16,19 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 CONTRACT_VERSION = "luxlm-render-contract-v3"
 IMAGE_PIPELINE_VERSION = "1.5.0"
-SELECTOR_LAYOUT_VERSION = "etsy-selector-card-v3-editorial-specimens"
 FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
@@ -47,7 +44,6 @@ MODE_CONTRACTS: dict[str, dict[str, Any]] = {
     "information_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
     "decorative_asset": {"expected_input_count": None, "output_kind": "decorative_asset", "generated_text": False},
     "designed_card": {"expected_input_count": None, "output_kind": "final_asset", "generated_text": True},
-    "selector_card": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": True},
 }
 ALLOWED_MODES = set(MODE_CONTRACTS)
 EXPECTED_INPUTS = {key: value["expected_input_count"] for key, value in MODE_CONTRACTS.items() if value["expected_input_count"] is not None}
@@ -150,68 +146,63 @@ class RenderRequest(BaseModel):
                 raise ValueError("designed_card_requires_headline")
             if not DESIGNED_CARD_PROHIBITIONS.issubset(set(self.prohibited_elements)):
                 raise ValueError("designed_card_requires_prohibitions")
+            selector_spec = self.card_brief.get("selector_spec") if isinstance(self.card_brief, dict) else None
+            if self.module in {"font_palette", "background_palette"} and not selector_spec:
+                raise ValueError("designed_card_selector_spec_required")
+            if selector_spec not in (None, {}):
+                if not isinstance(selector_spec, dict):
+                    raise ValueError("designed_card_invalid_selector_spec")
+                dimension = str(selector_spec.get("selector_dimension") or "").strip().lower()
+                if self.module == "font_palette" and dimension != "lettering":
+                    raise ValueError("designed_card_font_selector_dimension_invalid")
+                if self.module == "background_palette" and dimension != "background":
+                    raise ValueError("designed_card_background_selector_dimension_invalid")
+                if self.module not in {"font_palette", "background_palette"}:
+                    raise ValueError("designed_card_selector_module_invalid")
+                if dimension not in {"lettering", "background"}:
+                    raise ValueError("designed_card_selector_dimension_invalid")
+                if not bool(selector_spec.get("selection_optional")):
+                    raise ValueError("designed_card_selector_requires_optional_selection")
+                if not bool(selector_spec.get("artist_discretion_when_omitted")):
+                    raise ValueError("designed_card_selector_requires_artist_discretion")
+                if bool(selector_spec.get("workflow_uses_default_when_omitted")):
+                    raise ValueError("designed_card_selector_default_forbidden")
+                if str(selector_spec.get("default_font_option_id") or "").strip() or str(selector_spec.get("default_background_option_id") or "").strip():
+                    raise ValueError("designed_card_selector_default_id_forbidden")
+                if selector_spec.get("semantic_treatments_only") is not True:
+                    raise ValueError("designed_card_selector_requires_semantic_treatments")
+                if not str(selector_spec.get("default_note") or "").strip() or not str(selector_spec.get("truthfulness_note") or "").strip():
+                    raise ValueError("designed_card_selector_notes_required")
+                active_key = "lettering_options" if dimension == "lettering" else "background_options"
+                inactive_key = "background_options" if dimension == "lettering" else "lettering_options"
+                options = selector_spec.get(active_key)
+                if not isinstance(options, list) or not 1 <= len(options) <= 5 or selector_spec.get(inactive_key) not in (None, []):
+                    raise ValueError("designed_card_selector_options_invalid")
+                ids: list[str] = []
+                labels: list[str] = []
+                for option in options:
+                    if not isinstance(option, dict):
+                        raise ValueError("designed_card_selector_option_invalid")
+                    option_id = str(option.get("id") or "").strip()
+                    label = str(option.get("label") or "").strip()
+                    if not option_id or not label:
+                        raise ValueError("designed_card_selector_option_fields_required")
+                    ids.append(option_id)
+                    labels.append(label)
+                    if dimension == "lettering" and option.get("is_handwritten") is not True:
+                        raise ValueError("designed_card_selector_font_not_handwritten")
+                    if dimension == "background" and not str(option.get("colour_name") or label).strip():
+                        raise ValueError("designed_card_selector_colour_name_missing")
+                if len(ids) != len(set(ids)) or len(labels) != len(set(labels)):
+                    raise ValueError("designed_card_selector_duplicate_option")
+                if dimension == "lettering" and not str(selector_spec.get("sample_text") or "").strip():
+                    raise ValueError("designed_card_selector_sample_missing")
         else:
             if self.asset_roles:
                 role_urls = [role.url.strip() for role in self.asset_roles]
                 if self.input_urls and self.input_urls != role_urls:
                     raise ValueError("asset_roles_must_match_input_urls")
                 self.input_urls = role_urls
-
-        if self.mode == "selector_card":
-            spec = self.card_brief.get("selector_spec") if isinstance(self.card_brief, dict) else None
-            if not isinstance(spec, dict):
-                raise ValueError("selector_card_requires_selector_spec")
-            if len(self.input_urls) != 1:
-                raise ValueError("selector_card_requires_one_artwork")
-            if len(self.asset_roles) != 1 or self.asset_roles[0].role != "artwork_anchor":
-                raise ValueError("selector_card_requires_artwork_anchor")
-            if not bool(spec.get("selection_optional")):
-                raise ValueError("selector_card_requires_optional_selection")
-            default_note = str(spec.get("default_note") or "").strip()
-            if not default_note:
-                raise ValueError("selector_card_requires_default_note")
-            semantic_flag = spec.get("semantic_treatments_only")
-            if semantic_flag is not True:
-                raise ValueError("selector_card_requires_semantic_treatment_flag")
-            dimension = str(spec.get("selector_dimension") or "").strip().lower()
-            option_total = 0
-            for key in ("lettering_options", "background_options"):
-                options = spec.get(key) or []
-                if not isinstance(options, list) or len(options) > 5:
-                    raise ValueError("selector_card_invalid_options")
-                ids: list[str] = []
-                labels: list[str] = []
-                codes: list[str] = []
-                for option in options:
-                    if not isinstance(option, dict):
-                        raise ValueError("selector_card_invalid_option")
-                    option_id = str(option.get("id") or "").strip()
-                    label = str(option.get("label") or "").strip()
-                    code = str(option.get("code") or "").strip()
-                    if not option_id or not label or not code:
-                        raise ValueError("selector_card_option_fields_required")
-                    ids.append(option_id)
-                    labels.append(label)
-                    codes.append(code)
-                if len(ids) != len(set(ids)) or len(labels) != len(set(labels)) or len(codes) != len(set(codes)):
-                    raise ValueError("selector_card_duplicate_option")
-                option_total += len(options)
-            if option_total < 1:
-                raise ValueError("selector_card_requires_options")
-            lettering_count = len(spec.get("lettering_options") or [])
-            background_count = len(spec.get("background_options") or [])
-            if dimension not in {"lettering", "background", "dual"}:
-                dimension = "dual" if lettering_count and background_count else "lettering" if lettering_count else "background"
-            if dimension == "lettering" and (not lettering_count or background_count):
-                raise ValueError("selector_card_lettering_dimension_invalid")
-            if dimension == "background" and (not background_count or lettering_count):
-                raise ValueError("selector_card_background_dimension_invalid")
-            if dimension == "dual" and (not lettering_count or not background_count):
-                raise ValueError("selector_card_dual_dimension_invalid")
-            if dimension == "lettering" and not str(spec.get("sample_text") or "").strip():
-                raise ValueError("selector_card_lettering_sample_missing")
-            if not str(spec.get("truthfulness_note") or "").strip():
-                raise ValueError("selector_card_truthfulness_note_missing")
 
         if self.mode == "decorative_asset":
             if expected is None:
@@ -364,6 +355,33 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
             "Copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it."
         )
         instruction = "Create one cohesive, premium editorial Etsy gallery card for the supplied listing and module."
+        selector_spec = request.card_brief.get("selector_spec") if isinstance(request.card_brief, dict) else None
+        if isinstance(selector_spec, dict):
+            dimension = str(selector_spec.get("selector_dimension") or "").strip().lower()
+            options_key = "lettering_options" if dimension == "lettering" else "background_options"
+            options = [dict(item or {}) for item in (selector_spec.get(options_key) or [])]
+            labels = [str(item.get("label") or "").strip() for item in options]
+            common += (
+                " This is a buyer-facing personalization selector generated by Codex Image 2, not a software configuration panel. "
+                f"It is a dedicated {dimension} card. The title and every option label in selector_spec are approved visible copy: "
+                f"render each approved option label exactly once, with no invented option names and no omitted options. "
+                f"Approved option labels are {json.dumps(labels, ensure_ascii=False)}. "
+                "The selector must show real visual comparisons in the supplied listing artwork context and remain a premium editorial Etsy gallery card. "
+                "The optional note must make clear that leaving the choice blank means the artist chooses what suits the individual artwork best. "
+                "Do not claim exact font-file fidelity, exact glyph metrics, or exact RGB/hex colour formulas."
+            )
+            if dimension == "lettering":
+                common += (
+                    f" Use the single consistent sample phrase {json.dumps(str(selector_spec.get('sample_text') or '').strip(), ensure_ascii=False)}. "
+                    "All displayed treatments must look handwritten, signature-like, script-like, or calligraphic; never use generic serif or sans lettering. "
+                    "Make every handwritten treatment visibly and meaningfully different at Etsy mobile thumbnail size."
+                )
+            else:
+                common += (
+                    "Show each named colour as a visibly distinct treatment of the actual artwork or art fragment in context; tiny abstract swatches alone are insufficient. "
+                    "Use clear buyer-facing colour names, not vague mood categories."
+                )
+            instruction = "Create one cohesive, premium editorial Etsy personalization selector card with the supplied artwork as the visual authority."
     else:
         common = (
             "$imagegen\nBefore writing any textual response, invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one polished raster image, then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it. This is a decorative visual asset, not the final typography compositor. Never generate words, letters, numbers, pseudo-lettering, signatures, logos, watermarks, blank caption sheets, paper mats, empty label regions, marketing panels, generic information panels, prices, badges, or invented claims. Do not copy competitor branding, exact coordinates, distinctive protected elements, or source-image text. Preserve any role marked exact pixel preservation; the final system may composite that raster deterministically afterward."
@@ -809,259 +827,6 @@ def _release_failed_request(request_hash: str) -> None:
         _REQUEST_DIGESTS.pop(request_hash, None)
 
 
-def _selector_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
-    filename = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-    candidates = (
-        Path("/usr/share/fonts/truetype/dejavu") / filename,
-        Path("/usr/local/share/fonts") / filename,
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return ImageFont.truetype(str(candidate), size=size)
-    raise RuntimeError("selector_font_unavailable")
-
-
-def _selector_style_font(size: int, option_id: str, *, bold: bool = False) -> ImageFont.FreeTypeFont:
-    """Use typography as an honest visual approximation of a semantic treatment.
-
-    Fulfillment stores a semantic lettering treatment, not a guaranteed font
-    file. The selector therefore uses locally available families only to show
-    the character of each choice and explicitly says so on the card.
-    """
-    option = str(option_id or "").strip().lower()
-    if option == "listing_default":
-        filenames = ("DejaVuSerif-Bold.ttf", "DejaVuSerif.ttf") if bold else ("DejaVuSerif.ttf",)
-    elif option in {"classic_serif", "refined_serif"}:
-        filenames = ("DejaVuSerif-Bold.ttf", "DejaVuSerif.ttf")
-    elif option == "handwritten_script":
-        filenames = ("DejaVuSerif-Italic.ttf", "DejaVuSans-Oblique.ttf")
-    elif option == "soft_brush_script":
-        filenames = ("DejaVuSans-BoldOblique.ttf", "DejaVuSans-Oblique.ttf", "DejaVuSans.ttf")
-    elif option in {"editorial_small_caps", "minimal_capitals"}:
-        filenames = ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
-    elif option in {"playful_rounded", "clean_monoline", "modern_sans"}:
-        filenames = ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
-    else:
-        filenames = ("DejaVuSerif.ttf", "DejaVuSans.ttf")
-    for filename in filenames:
-        for root in (Path("/usr/share/fonts/truetype/dejavu"), Path("/usr/local/share/fonts")):
-            candidate = root / filename
-            if candidate.is_file():
-                return ImageFont.truetype(str(candidate), size=size)
-    return _selector_font(size, bold=bold)
-
-
-def _selector_options(spec: dict[str, Any], key: str) -> list[dict[str, str]]:
-    options = spec.get(key) or []
-    return [
-        {
-            "id": str(option.get("id") or "").strip(),
-            "label": str(option.get("label") or "").strip(),
-            "code": str(option.get("code") or "").strip(),
-        }
-        for option in options
-        if isinstance(option, dict)
-    ]
-
-
-def _selector_dimension(spec: dict[str, Any]) -> str:
-    explicit = str(spec.get("selector_dimension") or "").strip().lower()
-    if explicit in {"lettering", "background", "dual"}:
-        return explicit
-    lettering = bool(spec.get("lettering_options"))
-    backgrounds = bool(spec.get("background_options"))
-    return "dual" if lettering and backgrounds else "lettering" if lettering else "background"
-
-
-def _selector_fit_font(text: str, size: int, max_width: int, option_id: str, *, bold: bool = False) -> ImageFont.FreeTypeFont:
-    for candidate_size in range(size, 18, -2):
-        font = _selector_style_font(candidate_size, option_id, bold=bold)
-        box = font.getbbox(str(text))
-        if box[2] - box[0] <= max_width:
-            return font
-    return _selector_style_font(18, option_id, bold=bold)
-
-
-def _selector_title_font(size: int = 62) -> ImageFont.FreeTypeFont:
-    for filename in ("DejaVuSerif.ttf", "DejaVuSerif-Bold.ttf"):
-        for root in (Path("/usr/share/fonts/truetype/dejavu"), Path("/usr/local/share/fonts")):
-            candidate = root / filename
-            if candidate.is_file():
-                return ImageFont.truetype(str(candidate), size=size)
-    return _selector_font(size, bold=True)
-
-
-def _selector_draw_wash(canvas: Image.Image, box: tuple[int, int, int, int], color: tuple[int, int, int], *, alpha: int = 95) -> None:
-    left, top, right, bottom = box
-    wash = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(wash)
-    width = max(1, right - left)
-    height = max(1, bottom - top)
-    draw.ellipse((left - width // 5, top - height // 3, right + width // 7, bottom + height // 3), fill=(*color, alpha))
-    draw.ellipse((left + width // 5, top - height // 5, right + width // 3, bottom + height // 2), fill=(*color, max(25, alpha // 2)))
-    wash = wash.filter(ImageFilter.GaussianBlur(max(12, min(width, height) // 7)))
-    canvas.alpha_composite(wash)
-
-
-def _selector_artwork_anchor(canvas: Image.Image, artwork_path: Path, box: tuple[int, int, int, int]) -> None:
-    draw = ImageDraw.Draw(canvas)
-    left, top, right, bottom = box
-    draw.rounded_rectangle((left - 14, top - 14, right + 14, bottom + 14), radius=34, fill=(238, 231, 219, 255))
-    draw.rounded_rectangle(box, radius=26, fill=(255, 253, 247, 255), outline=(226, 217, 204, 255), width=3)
-    with Image.open(artwork_path) as raw_art:
-        art = raw_art.convert("RGB")
-        fitted = ImageOps.contain(art, (right - left - 38, bottom - top - 38), method=Image.Resampling.LANCZOS)
-    art_x = left + (right - left - fitted.width) // 2
-    art_y = top + (bottom - top - fitted.height) // 2
-    canvas.paste(fitted.convert("RGBA"), (art_x, art_y))
-
-
-def _selector_footer(canvas: Image.Image, spec: dict[str, Any], y: int) -> None:
-    draw = ImageDraw.Draw(canvas)
-    line = (218, 209, 197, 255)
-    muted = (92, 91, 87, 255)
-    draw.line((720, y - 22, 1450, y - 22), fill=line, width=2)
-    note_font = _selector_font(23)
-    truth_font = _selector_font(21)
-    default_note = str(spec.get("default_note") or "Optional — leave blank to use the shown style.").strip()
-    truthfulness = str(spec.get("truthfulness_note") or "Preview shows the style character; final treatment remains semantic.").strip()
-    draw.text((720, y), default_note, font=note_font, fill=muted)
-    draw.text((720, y + 38), truthfulness, font=truth_font, fill=muted)
-
-
-def _background_preview_color(option: dict[str, str]) -> tuple[int, int, int]:
-    palette = {
-        "listing_default": (237, 229, 210),
-        "warm_neutral": (218, 190, 154),
-        "blush_wash": (224, 174, 178),
-        "cool_neutral": (178, 202, 210),
-        "soft_colour_wash": (190, 207, 181),
-        "sage_wash": (165, 191, 157),
-        "blue_grey_wash": (157, 181, 195),
-        "cream_paper": (237, 224, 193),
-        "clean_white": (246, 246, 240),
-        "muted_ochre": (205, 179, 116),
-    }
-    option_id = str(option.get("id") or "").strip().lower()
-    if option_id in palette:
-        return palette[option_id]
-    digest = hashlib.sha256(option_id.encode("utf-8")).digest()
-    return tuple(145 + int(value) % 90 for value in digest[:3])
-
-
-def _selector_draw_lettering_sample(
-    canvas: Image.Image,
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    x: int,
-    y: int,
-    option: dict[str, str],
-    ink: tuple[int, int, int, int],
-    accent: tuple[int, int, int, int],
-) -> None:
-    option_id = str(option.get("id") or "").strip().lower()
-    bold = option_id == "soft_brush_script"
-    font = _selector_fit_font(text, 46, 430, option_id, bold=bold)
-    if option_id == "soft_brush_script":
-        box = font.getbbox(text)
-        width = max(180, box[2] - box[0])
-        _selector_draw_wash(canvas, (x - 16, y + 5, x + width + 30, y + 66), (203, 132, 116), alpha=46)
-        draw.text((x + 2, y + 2), text, font=font, fill=(203, 132, 116, 70))
-        draw.text((x, y), text, font=font, fill=ink, stroke_width=1, stroke_fill=(31, 53, 76, 120))
-    else:
-        draw.text((x, y), text, font=font, fill=ink)
-    if option_id == "handwritten_script":
-        box = font.getbbox(text)
-        width = max(160, box[2] - box[0])
-        points = [(x + 8, y + 58), (x + width // 3, y + 63), (x + (width * 2) // 3, y + 57), (x + width - 6, y + 61)]
-        draw.line(points, fill=accent, width=3, joint="curve")
-    elif option_id == "soft_brush_script":
-        box = font.getbbox(text)
-        width = max(180, box[2] - box[0])
-        draw.line((x + 4, y + 66, x + width - 4, y + 63), fill=accent, width=5)
-
-
-def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
-    width, height = 1536, 1024
-    dimension = _selector_dimension(spec)
-    paper = (248, 244, 235, 255)
-    ink = (31, 53, 76, 255)
-    muted = (88, 92, 90, 255)
-    accent = (203, 132, 116, 255)
-    canvas = Image.new("RGBA", (width, height), paper)
-    _selector_draw_wash(canvas, (30, 40, 720, 970), (226, 215, 182), alpha=40)
-    _selector_draw_wash(canvas, (720, 30, 1500, 960), (214, 224, 201), alpha=28)
-    draw = ImageDraw.Draw(canvas)
-    title_font = _selector_title_font(62)
-    subtitle_font = _selector_font(27)
-    label_font = _selector_font(24)
-    code_font = _selector_font(22, bold=True)
-    title = str(spec.get("title") or ("Choose Your Lettering" if dimension == "lettering" else "Choose Your Background" if dimension == "background" else "Choose Your Style")).strip()
-    subtitle = str(spec.get("subtitle") or ("Compare the lettering character for names, dates or a short phrase." if dimension == "lettering" else "Compare the background mood behind your finished artwork.")).strip()
-    draw.text((78, 54), title, font=title_font, fill=ink)
-    draw.text((82, 137), subtitle, font=subtitle_font, fill=muted)
-
-    art_box = (82, 220, 640, 848)
-    _selector_artwork_anchor(canvas, artwork_path, art_box)
-    draw.text((86, 875), str(spec.get("anchor_label") or "Listing artwork"), font=label_font, fill=muted)
-
-    lettering = _selector_options(spec, "lettering_options")
-    backgrounds = _selector_options(spec, "background_options")
-    row_x, row_top, row_width, row_height = 720, 218, 730, 116
-    rule = (218, 209, 197, 230)
-    option_number_font = _selector_font(21, bold=True)
-
-    if dimension == "lettering":
-        draw.text((row_x, 214), "LETTERING STUDY", font=_selector_font(25, bold=True), fill=ink)
-        sample = str(spec.get("sample_text") or "Your names").strip()
-        for index, option in enumerate(lettering):
-            top = row_top + 45 + index * row_height
-            code = option["code"]
-            number_box = draw.textbbox((0, 0), code, font=option_number_font)
-            draw.text((row_x + 8, top + 18), code, font=option_number_font, fill=(166, 111, 98, 255))
-            _selector_draw_lettering_sample(canvas, draw, sample, row_x + 82, top + 4, option, ink, accent)
-            label = option["label"]
-            label_text = label + ("  ·  SHOWN" if index == 0 else "")
-            draw.text((row_x + 82, top + 69), label_text, font=label_font, fill=muted)
-            if index == 0:
-                _selector_draw_wash(canvas, (row_x + 570, top + 12, row_x + 710, top + 70), (226, 215, 182), alpha=38)
-            draw.line((row_x + 82, top + 101, row_x + row_width, top + 101), fill=rule, width=2)
-    elif dimension == "background":
-        draw.text((row_x, 214), "BACKGROUND MOOD STUDIES", font=_selector_font(25, bold=True), fill=ink)
-        for index, option in enumerate(backgrounds):
-            top = row_top + 45 + index * row_height
-            color = _background_preview_color(option)
-            swatch = (row_x + 58, top + 14, row_x + 340, top + 78)
-            _selector_draw_wash(canvas, swatch, color, alpha=120)
-            _selector_draw_wash(canvas, (row_x + 98, top + 24, row_x + 290, top + 69), tuple(min(255, value + 22) for value in color), alpha=68)
-            code = option["code"]
-            draw.text((row_x + 12, top + 27), code, font=option_number_font, fill=(166, 111, 98, 255))
-            label_text = option["label"] + ("  ·  SHOWN" if index == 0 else "")
-            background_label_font = _selector_fit_font(label_text, 28, 340, "modern_sans")
-            draw.text((row_x + 382, top + 18), label_text, font=background_label_font, fill=ink)
-            draw.text((row_x + 382, top + 57), "watercolour mood preview", font=_selector_font(19), fill=muted)
-            draw.line((row_x + 382, top + 101, row_x + row_width, top + 101), fill=rule, width=2)
-    else:
-        # Retain a bounded legacy rendering path for old callers. The live
-        # gallery-builder never selects this combined presentation anymore.
-        draw.text((row_x, 214), "STYLE OPTIONS", font=_selector_font(25, bold=True), fill=ink)
-        options = lettering + backgrounds
-        for index, option in enumerate(options[:5]):
-            top = row_top + 45 + index * row_height
-            draw.rounded_rectangle((row_x, top, row_x + row_width, top + 94), radius=22, fill=(253, 249, 242, 185), outline=(224, 215, 203, 210), width=2)
-            draw.text((row_x + 35, top + 25), option["code"], font=code_font, fill=ink)
-            draw.text((row_x + 112, top + 23), option["label"], font=_selector_font(29), fill=ink)
-
-    _selector_footer(canvas, spec, 874)
-
-    output = BytesIO()
-    canvas.convert("RGB").save(output, format="PNG", optimize=True)
-    data = output.getvalue()
-    if len(data) > MAX_OUTPUT_BYTES:
-        raise RuntimeError("output_too_large")
-    return data
-
-
 def _render(request: RenderRequest) -> tuple[bytes, str, str]:
     urls = [_validate_public_https_url(url) for url in request.input_urls]
     template_url = _validate_public_https_url(request.template_reference_url) if request.template_reference_url else None
@@ -1069,7 +834,7 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
     async_context = bool(getattr(_ASYNC_RENDER_CONTEXT, "active", False))
     if not async_context:
         _claim_request(request_hash)
-    if request.mode != "selector_card" and not readiness()["ready"]:
+    if not readiness()["ready"]:
         if not async_context:
             _release_failed_request(request_hash)
         raise RuntimeError("renderer_not_ready")
@@ -1089,14 +854,6 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
         with tempfile.TemporaryDirectory(prefix="render-", dir=root) as temp:
             workspace = Path(temp)
             inputs = [_download_image(url, workspace / f"input-{index}") for index, url in enumerate(urls, 1)]
-            if request.mode == "selector_card":
-                selector_spec = request.card_brief.get("selector_spec") if isinstance(request.card_brief, dict) else {}
-                data = _render_selector_card(inputs[0], selector_spec)
-                digest = hashlib.sha256(data).hexdigest()
-                with _REQUEST_DIGESTS_LOCK:
-                    if request_hash in _REQUEST_DIGESTS:
-                        _REQUEST_DIGESTS[request_hash].update({"status": "succeeded", "output_sha256": digest})
-                return data, "image/png", digest
             reference = None
             if template_url:
                 reference = _download_image(template_url, workspace / "design-reference")
@@ -1416,7 +1173,7 @@ def render_async(request: RenderRequest, authorization: str | None = Header(defa
             _validate_public_https_url(request.template_reference_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if request.mode != "selector_card" and not readiness()["ready"]:
+    if not readiness()["ready"]:
         raise HTTPException(status_code=503, detail="renderer_not_ready")
     _restore_async_state()
     _prune_async_jobs()
