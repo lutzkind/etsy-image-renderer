@@ -28,10 +28,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 CONTRACT_VERSION = "luxlm-render-contract-v3"
 IMAGE_PIPELINE_VERSION = "1.5.0"
-SELECTOR_LAYOUT_VERSION = "etsy-selector-card-v2-editorial-dimension-specific"
+SELECTOR_LAYOUT_VERSION = "etsy-selector-card-v3-editorial-specimens"
 FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
@@ -949,6 +949,38 @@ def _background_preview_color(option: dict[str, str]) -> tuple[int, int, int]:
     return tuple(145 + int(value) % 90 for value in digest[:3])
 
 
+def _selector_draw_lettering_sample(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    x: int,
+    y: int,
+    option: dict[str, str],
+    ink: tuple[int, int, int, int],
+    accent: tuple[int, int, int, int],
+) -> None:
+    option_id = str(option.get("id") or "").strip().lower()
+    bold = option_id == "soft_brush_script"
+    font = _selector_fit_font(text, 46, 430, option_id, bold=bold)
+    if option_id == "soft_brush_script":
+        box = font.getbbox(text)
+        width = max(180, box[2] - box[0])
+        _selector_draw_wash(canvas, (x - 16, y + 5, x + width + 30, y + 66), (203, 132, 116), alpha=46)
+        draw.text((x + 2, y + 2), text, font=font, fill=(203, 132, 116, 70))
+        draw.text((x, y), text, font=font, fill=ink, stroke_width=1, stroke_fill=(31, 53, 76, 120))
+    else:
+        draw.text((x, y), text, font=font, fill=ink)
+    if option_id == "handwritten_script":
+        box = font.getbbox(text)
+        width = max(160, box[2] - box[0])
+        points = [(x + 8, y + 58), (x + width // 3, y + 63), (x + (width * 2) // 3, y + 57), (x + width - 6, y + 61)]
+        draw.line(points, fill=accent, width=3, joint="curve")
+    elif option_id == "soft_brush_script":
+        box = font.getbbox(text)
+        width = max(180, box[2] - box[0])
+        draw.line((x + 4, y + 66, x + width - 4, y + 63), fill=accent, width=5)
+
+
 def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
     width, height = 1536, 1024
     dimension = _selector_dimension(spec)
@@ -956,7 +988,6 @@ def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
     ink = (31, 53, 76, 255)
     muted = (88, 92, 90, 255)
     accent = (203, 132, 116, 255)
-    sage = (153, 174, 137, 255)
     canvas = Image.new("RGBA", (width, height), paper)
     _selector_draw_wash(canvas, (30, 40, 720, 970), (226, 215, 182), alpha=40)
     _selector_draw_wash(canvas, (720, 30, 1500, 960), (214, 224, 201), alpha=28)
@@ -977,44 +1008,39 @@ def _render_selector_card(artwork_path: Path, spec: dict[str, Any]) -> bytes:
     lettering = _selector_options(spec, "lettering_options")
     backgrounds = _selector_options(spec, "background_options")
     row_x, row_top, row_width, row_height = 720, 218, 730, 116
+    rule = (218, 209, 197, 230)
+    option_number_font = _selector_font(21, bold=True)
 
     if dimension == "lettering":
-        draw.text((row_x, 214), "LETTERING STYLE", font=_selector_font(25, bold=True), fill=ink)
+        draw.text((row_x, 214), "LETTERING STUDY", font=_selector_font(25, bold=True), fill=ink)
         sample = str(spec.get("sample_text") or "Your names").strip()
         for index, option in enumerate(lettering):
             top = row_top + 45 + index * row_height
-            fill = (250, 246, 238, 235) if index == 0 else (253, 249, 242, 185)
-            draw.rounded_rectangle((row_x, top, row_x + row_width, top + 94), radius=22, fill=fill, outline=(224, 215, 203, 210), width=2)
-            _selector_draw_wash(canvas, (row_x + 24, top + 18, row_x + 66, top + 76), (203, 132, 116) if index % 2 == 0 else (153, 174, 137), alpha=105)
             code = option["code"]
-            draw.ellipse((row_x + 22, top + 23, row_x + 68, top + 69), fill=(31, 53, 76, 245))
-            code_box = draw.textbbox((0, 0), code, font=code_font)
-            draw.text((row_x + 45 - (code_box[2] - code_box[0]) / 2, top + 45 - (code_box[3] - code_box[1]) / 2 - 2), code, font=code_font, fill=(255, 252, 245, 255))
-            sample_font = _selector_fit_font(sample, 43, 390, option["id"])
-            draw.text((row_x + 92, top + 12), sample, font=sample_font, fill=ink)
+            number_box = draw.textbbox((0, 0), code, font=option_number_font)
+            draw.text((row_x + 8, top + 18), code, font=option_number_font, fill=(166, 111, 98, 255))
+            _selector_draw_lettering_sample(canvas, draw, sample, row_x + 82, top + 4, option, ink, accent)
             label = option["label"]
-            label_box = draw.textbbox((0, 0), label, font=label_font)
-            draw.text((row_x + 92, top + 65), label, font=label_font, fill=muted)
+            label_text = label + ("  ·  SHOWN" if index == 0 else "")
+            draw.text((row_x + 82, top + 69), label_text, font=label_font, fill=muted)
             if index == 0:
-                shown_font = _selector_font(18, bold=True)
-                draw.text((row_x + row_width - 115, top + 68), "SHOWN", font=shown_font, fill=(166, 111, 98, 255))
+                _selector_draw_wash(canvas, (row_x + 570, top + 12, row_x + 710, top + 70), (226, 215, 182), alpha=38)
+            draw.line((row_x + 82, top + 101, row_x + row_width, top + 101), fill=rule, width=2)
     elif dimension == "background":
-        draw.text((row_x, 214), "BACKGROUND MOOD", font=_selector_font(25, bold=True), fill=ink)
+        draw.text((row_x, 214), "BACKGROUND MOOD STUDIES", font=_selector_font(25, bold=True), fill=ink)
         for index, option in enumerate(backgrounds):
             top = row_top + 45 + index * row_height
             color = _background_preview_color(option)
-            draw.rounded_rectangle((row_x, top, row_x + row_width, top + 94), radius=22, fill=(253, 249, 242, 185), outline=(224, 215, 203, 210), width=2)
-            swatch = (row_x + 22, top + 19, row_x + 188, top + 75)
-            draw.rounded_rectangle(swatch, radius=28, fill=(*color, 180))
-            _selector_draw_wash(canvas, swatch, color, alpha=110)
-            draw.rounded_rectangle((row_x + 22, top + 19, row_x + 188, top + 75), radius=28, outline=(255, 252, 245, 220), width=2)
+            swatch = (row_x + 58, top + 14, row_x + 340, top + 78)
+            _selector_draw_wash(canvas, swatch, color, alpha=120)
+            _selector_draw_wash(canvas, (row_x + 98, top + 24, row_x + 290, top + 69), tuple(min(255, value + 22) for value in color), alpha=68)
             code = option["code"]
-            code_box = draw.textbbox((0, 0), code, font=code_font)
-            draw.text((row_x + 105 - (code_box[2] - code_box[0]) / 2, top + 47 - (code_box[3] - code_box[1]) / 2 - 2), code, font=code_font, fill=ink)
-            draw.text((row_x + 220, top + 20), option["label"], font=_selector_font(29), fill=ink)
-            draw.text((row_x + 220, top + 59), "watercolour mood preview", font=_selector_font(19), fill=muted)
-            if index == 0:
-                draw.text((row_x + row_width - 115, top + 68), "SHOWN", font=_selector_font(18, bold=True), fill=(166, 111, 98, 255))
+            draw.text((row_x + 12, top + 27), code, font=option_number_font, fill=(166, 111, 98, 255))
+            label_text = option["label"] + ("  ·  SHOWN" if index == 0 else "")
+            background_label_font = _selector_fit_font(label_text, 28, 340, "modern_sans")
+            draw.text((row_x + 382, top + 18), label_text, font=background_label_font, fill=ink)
+            draw.text((row_x + 382, top + 57), "watercolour mood preview", font=_selector_font(19), fill=muted)
+            draw.line((row_x + 382, top + 101, row_x + row_width, top + 101), fill=rule, width=2)
     else:
         # Retain a bounded legacy rendering path for old callers. The live
         # gallery-builder never selects this combined presentation anymore.

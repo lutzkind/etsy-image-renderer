@@ -102,7 +102,7 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.7.0"
+    assert renderer.APP_VERSION == "1.8.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
         "before_after_card": 2, "information_card": 2, "selector_card": 1,
@@ -335,7 +335,7 @@ def test_fresh_capability_status_requires_current_generation_proofs(tmp_path, mo
     assert initial["fresh_render_verified"] is False
     assert initial["fresh_gallery_capability_verified"] is False
 
-    # Legacy proof from renderer 1.5.0 remains valid after the 1.7.0 app-only
+    # Legacy proof from renderer 1.5.0 remains valid after the 1.8.0 app-only
     # selector change because the Codex image-generation pipeline did not change.
     proof = {
         "schema_version": renderer.FRESH_PROOF_SCHEMA_VERSION,
