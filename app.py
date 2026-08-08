@@ -45,6 +45,7 @@ MODE_CONTRACTS: dict[str, dict[str, Any]] = {
     "information_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
     "decorative_asset": {"expected_input_count": None, "output_kind": "decorative_asset", "generated_text": False},
     "designed_card": {"expected_input_count": None, "output_kind": "final_asset", "generated_text": True},
+    "selector_card": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": True},
 }
 ALLOWED_MODES = set(MODE_CONTRACTS)
 EXPECTED_INPUTS = {key: value["expected_input_count"] for key, value in MODE_CONTRACTS.items() if value["expected_input_count"] is not None}
