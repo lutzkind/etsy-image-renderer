@@ -113,7 +113,7 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.9.0"
+    assert renderer.APP_VERSION == "1.10.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
         "before_after_card": 2, "information_card": 2,
@@ -323,6 +323,21 @@ def test_legacy_lifestyle_prompt_keeps_image_two_ground_truth():
     prompt = renderer._prompt("lifestyle", "pet portrait")
     assert "second asset as the exact artwork target" in prompt
     assert "preserve the room" in prompt
+
+
+def test_minimal_frame_prompt_is_a_physical_frame_only_contract():
+    prompt = renderer._prompt("minimal_frame", "couple portrait")
+    for required in [
+        "physical neutral frame",
+        "visible rigid frame edge",
+        "frame-only",
+        "digital screen",
+        "monitor",
+        "laptop",
+        "room scene",
+        "flat bordered raster",
+    ]:
+        assert required in prompt
 
 
 def test_app_server_command_enables_image_generation():

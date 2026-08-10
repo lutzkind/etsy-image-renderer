@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 CONTRACT_VERSION = "luxlm-render-contract-v3"
 IMAGE_PIPELINE_VERSION = "1.5.0"
 FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
@@ -387,7 +387,14 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
             "$imagegen\nBefore writing any textual response, invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one polished raster image, then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it. This is a decorative visual asset, not the final typography compositor. Never generate words, letters, numbers, pseudo-lettering, signatures, logos, watermarks, blank caption sheets, paper mats, empty label regions, marketing panels, generic information panels, prices, badges, or invented claims. Do not copy competitor branding, exact coordinates, distinctive protected elements, or source-image text. Preserve any role marked exact pixel preservation; the final system may composite that raster deterministically afterward."
         )
         instruction = {
-            "minimal_frame": "Create a restrained ecommerce frame presentation around the exact finished artwork.",
+            "minimal_frame": (
+                "Create a restrained premium ecommerce artwork-in-frame hero around the exact finished artwork. "
+                "This mode is frame-only: show exactly one physical neutral frame with a clearly visible rigid frame edge "
+                "on all four sides and the complete artwork inside it. Do not create a flat bordered raster, poster sheet, "
+                "digital screen, monitor, laptop, tablet, device, room scene, wall scene, desk, table, shelf, studio interior, "
+                "lifestyle environment, room decor, props, or Unsplash-style stock-photo scene. The output must read as a "
+                "clean isolated frame mockup at Etsy thumbnail size, not as a screen presentation or an unframed artwork."
+            ),
             "lifestyle": "Use the room as the physical context and the second asset as the exact artwork target; preserve the room and do not redraw the artwork.",
             "orientation": "Create a clean presentation of the exact complete artwork without cropping important architecture or subject content.",
             "before_after_card": "Create a visual-only before/after supporting asset; do not add text or a generic information panel.",
