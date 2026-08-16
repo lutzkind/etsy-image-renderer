@@ -895,10 +895,10 @@ def _deterministic_composite(request: RenderRequest, scene: Image.Image, artwork
     """Compose an Image 2-prepared scene and the approved artwork without generative editing."""
     canvas_size = (1536, 1024)
     if request.mode == "deterministic_frame":
-        # The generated scene is intentionally only atmosphere. A restrained
-        # neutral backdrop keeps the frame contract valid even when Image 2
-        # returns a scene with no usable wall placement.
-        canvas = ImageOps.fit(scene.convert("RGB"), canvas_size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        # The Codex preparation call is required for capability and style
+        # variation, but a frame-only hero must not leak room or screen cues
+        # from that preparation into the final customer-facing raster.
+        canvas = Image.new("RGB", canvas_size, (239, 237, 230))
     else:
         canvas = ImageOps.fit(scene.convert("RGB"), canvas_size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
     box = _deterministic_artwork_box(request, artwork.size)
