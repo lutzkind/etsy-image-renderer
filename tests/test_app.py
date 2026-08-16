@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import socket
 import subprocess
 import sys
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -116,6 +118,7 @@ def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
     assert renderer.APP_VERSION == "1.10.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
+        "deterministic_frame": 1, "deterministic_lifestyle": 2,
         "before_after_card": 2, "information_card": 2,
     }
     with pytest.raises((ValueError, ValidationError), match="invalid_render_mode"):
@@ -323,6 +326,56 @@ def test_legacy_lifestyle_prompt_keeps_image_two_ground_truth():
     prompt = renderer._prompt("lifestyle", "pet portrait")
     assert "second asset as the exact artwork target" in prompt
     assert "preserve the room" in prompt
+
+
+def _valid_png(width=24, height=18, colour=(120, 80, 40)):
+    output = io.BytesIO()
+    Image.new("RGB", (width, height), colour).save(output, format="PNG")
+    return output.getvalue()
+
+
+def test_deterministic_lifestyle_contract_requires_immutable_artwork_and_geometry():
+    payload = {
+        "mode": "deterministic_lifestyle",
+        "input_urls": ["https://example.com/room.jpg", "https://example.com/art.jpg"],
+        "expected_input_count": 2,
+        "asset_roles": [
+            {"role": "source_room_reference", "url": "https://example.com/room.jpg", "transform_allowed": True},
+            {"role": "approved_listing_artwork", "url": "https://example.com/art.jpg", "exact_pixel_preservation": True, "transform_allowed": False},
+        ],
+        "layout_contract": {"artwork_box_percent": [25, 10, 75, 90]},
+        "generation_instructions": {"prepare_scene_with_codex": True},
+    }
+    request = renderer.RenderRequest.model_validate(payload)
+    assert request.mode == "deterministic_lifestyle"
+    assert renderer._role_contract(request)["output_kind"] == "deterministic_composite"
+
+    invalid = dict(payload)
+    invalid["asset_roles"] = [
+        {"role": "source_room_reference", "url": "https://example.com/room.jpg", "transform_allowed": True},
+        {"role": "approved_listing_artwork", "url": "https://example.com/art.jpg", "exact_pixel_preservation": True, "transform_allowed": True},
+    ]
+    with pytest.raises((ValueError, ValidationError), match="immutable"):
+        renderer.RenderRequest.model_validate(invalid)
+
+
+def test_deterministic_composite_preserves_artwork_aspect_ratio():
+    request = renderer.RenderRequest.model_validate({
+        "mode": "deterministic_frame",
+        "input_urls": ["https://example.com/art.jpg"],
+        "expected_input_count": 1,
+        "asset_roles": [{"role": "approved_listing_artwork", "url": "https://example.com/art.jpg", "exact_pixel_preservation": True, "transform_allowed": False}],
+        "layout_contract": {"artwork_box_percent": [35, 10, 65, 90]},
+        "generation_instructions": {"prepare_scene_with_codex": True},
+    })
+    scene = Image.new("RGB", (80, 50), (240, 240, 240))
+    artwork = Image.new("RGB", (20, 40), (20, 100, 180))
+    output, _ = renderer._deterministic_composite(request, scene, artwork)
+    with Image.open(io.BytesIO(output)) as image:
+        assert image.size == (1536, 1024)
+    box = renderer._deterministic_artwork_box(request, artwork.size)
+    fitted, _ = renderer._fit_artwork(artwork, box)
+    assert abs((artwork.width / artwork.height) - (fitted.width / fitted.height)) < 0.0001
 
 
 def test_minimal_frame_prompt_is_a_physical_frame_only_contract():

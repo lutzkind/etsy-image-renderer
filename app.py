@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import os
@@ -23,6 +24,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
@@ -39,6 +41,8 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 MODE_CONTRACTS: dict[str, dict[str, Any]] = {
     "minimal_frame": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": False},
     "lifestyle": {"expected_input_count": 2, "output_kind": "final_asset", "generated_text": False},
+    "deterministic_frame": {"expected_input_count": 1, "output_kind": "deterministic_composite", "generated_text": False},
+    "deterministic_lifestyle": {"expected_input_count": 2, "output_kind": "deterministic_composite", "generated_text": False},
     "orientation": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": False},
     "before_after_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
     "information_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
@@ -197,6 +201,27 @@ class RenderRequest(BaseModel):
                     raise ValueError("designed_card_selector_duplicate_option")
                 if dimension == "lettering" and not str(selector_spec.get("sample_text") or "").strip():
                     raise ValueError("designed_card_selector_sample_missing")
+        elif self.mode in {"deterministic_frame", "deterministic_lifestyle"}:
+            if len(self.asset_roles) != len(self.input_urls):
+                raise ValueError("deterministic_composite_asset_roles_required")
+            if not self.asset_roles:
+                raise ValueError("deterministic_composite_asset_roles_required")
+            artwork_role = self.asset_roles[-1]
+            if artwork_role.role not in {"approved_listing_artwork", "listing_artwork"}:
+                raise ValueError("deterministic_composite_artwork_role_required")
+            if not artwork_role.exact_pixel_preservation or artwork_role.transform_allowed:
+                raise ValueError("deterministic_composite_artwork_must_be_immutable")
+            if self.generation_instructions.get("prepare_scene_with_codex") is not True:
+                raise ValueError("deterministic_composite_requires_scene_preparation")
+            box = self.layout_contract.get("artwork_box_percent")
+            if not isinstance(box, list) or len(box) != 4:
+                raise ValueError("deterministic_composite_artwork_box_required")
+            try:
+                left, top, right, bottom = [float(value) for value in box]
+            except (TypeError, ValueError) as exc:
+                raise ValueError("deterministic_composite_artwork_box_invalid") from exc
+            if not (0 <= left < right <= 100 and 0 <= top < bottom <= 100):
+                raise ValueError("deterministic_composite_artwork_box_invalid")
         else:
             if self.asset_roles:
                 role_urls = [role.url.strip() for role in self.asset_roles]
@@ -387,6 +412,14 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
             "$imagegen\nBefore writing any textual response, invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one polished raster image, then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it. This is a decorative visual asset, not the final typography compositor. Never generate words, letters, numbers, pseudo-lettering, signatures, logos, watermarks, blank caption sheets, paper mats, empty label regions, marketing panels, generic information panels, prices, badges, or invented claims. Do not copy competitor branding, exact coordinates, distinctive protected elements, or source-image text. Preserve any role marked exact pixel preservation; the final system may composite that raster deterministically afterward."
         )
         instruction = {
+            "deterministic_frame": (
+                "Prepare an elegant minimal EMPTY presentation scene only. Do not include the supplied artwork, any subject, text, lettering, or a second image. "
+                "The final service inserts the approved artwork raster deterministically after this scene is generated."
+            ),
+            "deterministic_lifestyle": (
+                "Prepare an EMPTY lifestyle room scene only. Preserve the room atmosphere and create a tasteful clear artwork placement area, "
+                "but do not include, redraw, repaint, warp, or describe the supplied artwork. The final service inserts the approved artwork raster deterministically."
+            ),
             "minimal_frame": (
                 "Create a restrained premium ecommerce artwork-in-frame hero around the exact finished artwork. "
                 "This mode is frame-only: show exactly one physical neutral frame with a clearly visible rigid frame edge "
@@ -834,6 +867,92 @@ def _release_failed_request(request_hash: str) -> None:
         _REQUEST_DIGESTS.pop(request_hash, None)
 
 
+def _deterministic_artwork_box(request: RenderRequest, artwork_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    raw_box = request.layout_contract.get("artwork_box_percent") or [24, 10, 76, 90]
+    left, top, right, bottom = [float(value) for value in raw_box]
+    canvas_width, canvas_height = (1536, 1024)
+    box_left = max(0, min(canvas_width - 1, round(canvas_width * left / 100)))
+    box_top = max(0, min(canvas_height - 1, round(canvas_height * top / 100)))
+    box_right = max(box_left + 1, min(canvas_width, round(canvas_width * right / 100)))
+    box_bottom = max(box_top + 1, min(canvas_height, round(canvas_height * bottom / 100)))
+    source_width, source_height = artwork_size
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("deterministic_composite_artwork_dimensions_invalid")
+    return box_left, box_top, box_right, box_bottom
+
+
+def _fit_artwork(artwork: Image.Image, box: tuple[int, int, int, int]) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    left, top, right, bottom = box
+    available_width = max(1, right - left)
+    available_height = max(1, bottom - top)
+    fitted = ImageOps.contain(artwork.convert("RGB"), (available_width, available_height), method=Image.Resampling.LANCZOS)
+    fitted_left = left + (available_width - fitted.width) // 2
+    fitted_top = top + (available_height - fitted.height) // 2
+    return fitted, (fitted_left, fitted_top, fitted_left + fitted.width, fitted_top + fitted.height)
+
+
+def _deterministic_composite(request: RenderRequest, scene: Image.Image, artwork: Image.Image) -> tuple[bytes, str]:
+    """Compose an Image 2-prepared scene and the approved artwork without generative editing."""
+    canvas_size = (1536, 1024)
+    if request.mode == "deterministic_frame":
+        # The generated scene is intentionally only atmosphere. A restrained
+        # neutral backdrop keeps the frame contract valid even when Image 2
+        # returns a scene with no usable wall placement.
+        canvas = ImageOps.fit(scene.convert("RGB"), canvas_size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    else:
+        canvas = ImageOps.fit(scene.convert("RGB"), canvas_size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    box = _deterministic_artwork_box(request, artwork.size)
+    fitted, placed = _fit_artwork(artwork, box)
+    left, top, right, bottom = placed
+
+    shadow = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rectangle((left + 12, top + 14, right + 12, bottom + 14), fill=(0, 0, 0, 90))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(12))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), shadow)
+
+    frame_padding = 16
+    frame_left = max(0, left - frame_padding)
+    frame_top = max(0, top - frame_padding)
+    frame_right = min(canvas_size[0] - 1, right + frame_padding)
+    frame_bottom = min(canvas_size[1] - 1, bottom + frame_padding)
+    frame = ImageDraw.Draw(canvas)
+    frame.rectangle((frame_left, frame_top, frame_right, frame_bottom), fill=(34, 34, 31, 255), outline=(224, 218, 201, 255), width=5)
+    canvas.alpha_composite(fitted.convert("RGBA"), (left, top))
+
+    output = io.BytesIO()
+    canvas.convert("RGB").save(output, format="PNG", optimize=True)
+    return output.getvalue(), json.dumps({
+        "mode": "deterministic_raster_composite",
+        "artwork_box": [left, top, right, bottom],
+        "artwork_source_size": [artwork.width, artwork.height],
+        "artwork_output_size": [fitted.width, fitted.height],
+        "aspect_ratio_preserved": abs((artwork.width / artwork.height) - (fitted.width / fitted.height)) < 0.0001,
+        "transform": "uniform_contain",
+        "artwork_content_source": "approved_input_raster",
+    }, sort_keys=True)
+
+
+def _render_deterministic(request: RenderRequest, workspace: Path, inputs: list[Path], before: dict[str, tuple[int, int]]) -> tuple[bytes, str, str, list[Path]]:
+    scene_inputs = inputs[:-1] if request.mode == "deterministic_lifestyle" else []
+    scene_run = _run_codex_app_server(workspace, scene_inputs, _prompt(request), max(60, min(int(os.environ.get("CODEX_RENDER_TIMEOUT_SECONDS", "900")), 1800)))
+    scene_outputs = _new_outputs(workspace, before, inputs)
+    scene_outputs.extend(path for path in scene_run.saved_paths if path not in scene_outputs)
+    if scene_run.returncode != 0:
+        raise RuntimeError("codex_scene_preparation_failed")
+    candidates = [path for path in scene_outputs if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
+    if len(candidates) != 1:
+        raise RuntimeError("codex_scene_preparation_output_ambiguous")
+    try:
+        scene = Image.open(candidates[0]).convert("RGB")
+        artwork = Image.open(inputs[-1]).convert("RGB")
+    except Exception as exc:
+        raise RuntimeError("deterministic_composite_input_decode_failed") from exc
+    data, _ = _deterministic_composite(request, scene, artwork)
+    digest = hashlib.sha256(data).hexdigest()
+    return data, "image/png", digest, scene_outputs
+
+
 def _render(request: RenderRequest) -> tuple[bytes, str, str]:
     urls = [_validate_public_https_url(url) for url in request.input_urls]
     template_url = _validate_public_https_url(request.template_reference_url) if request.template_reference_url else None
@@ -869,6 +988,14 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                 command_inputs.append(reference)
             before = _snapshot(workspace)
             timeout = max(60, min(int(os.environ.get("CODEX_RENDER_TIMEOUT_SECONDS", "900")), 1800))
+            if request.mode in {"deterministic_frame", "deterministic_lifestyle"}:
+                data, mime, digest, scene_outputs = _render_deterministic(request, workspace, inputs, before)
+                outputs.extend(scene_outputs)
+                _record_fresh_proof(request.mode, request_hash, digest, "deterministic_scene_preparation;items=image_generation_call")
+                with _REQUEST_DIGESTS_LOCK:
+                    if request_hash in _REQUEST_DIGESTS:
+                        _REQUEST_DIGESTS[request_hash].update({"status": "succeeded", "output_sha256": digest, "composition_mode": "deterministic_raster_composite"})
+                return data, mime, digest
             prompt_context = ""
             if reference is not None:
                 prompt_context = "The final supplied image is DESIGN REFERENCE ONLY and is inspiration-only. Do not treat it as a listing asset, do not preserve its pixels, and do not copy it exactly."
@@ -1138,6 +1265,8 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
         "mime": str(job.get("mime") or "image/png"),
         "output_sha256": str(job.get("output_sha256") or job.get("digest") or ""),
     })
+    if str(job.get("mode") or "") in {"deterministic_frame", "deterministic_lifestyle"}:
+        payload["composition_mode"] = "deterministic_raster_composite"
     return JSONResponse(payload, status_code=200)
 
 
@@ -1167,6 +1296,7 @@ async def render(request: RenderRequest, authorization: str | None = Header(defa
     return Response(content=data, media_type=mime, headers={
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Render-Mode": request.mode, "X-Image-Sha256": digest, "X-Render-Request-Sha256": _request_hash(request),
+        "X-Composition-Mode": "deterministic_raster_composite" if request.mode in {"deterministic_frame", "deterministic_lifestyle"} else "generative_final_raster",
     })
 
 
@@ -1239,4 +1369,5 @@ def render_async_result(job_id: str, authorization: str | None = Header(default=
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Image-Sha256": str(job.get("output_sha256") or job.get("digest") or ""),
         "X-Render-Request-Sha256": str(job.get("request_hash") or ""),
+        "X-Composition-Mode": "deterministic_raster_composite" if str(job.get("mode") or "") in {"deterministic_frame", "deterministic_lifestyle"} else "generative_final_raster",
     })
