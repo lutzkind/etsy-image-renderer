@@ -940,8 +940,12 @@ def _render_deterministic(request: RenderRequest, workspace: Path, inputs: list[
     scene_outputs.extend(path for path in scene_run.saved_paths if path not in scene_outputs)
     if scene_run.returncode != 0:
         raise RuntimeError("codex_scene_preparation_failed")
-    candidates = [path for path in scene_outputs if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
+    saved_candidates = [path for path in scene_run.saved_paths if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
+    candidates = saved_candidates or [path for path in scene_outputs if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
     if len(candidates) != 1:
+        # Codex can emit more than one changed workspace artifact while still
+        # providing one authoritative imageGeneration.savedPath. If no saved
+        # path exists, fail closed rather than guessing between unrelated files.
         raise RuntimeError("codex_scene_preparation_output_ambiguous")
     try:
         scene = Image.open(candidates[0]).convert("RGB")
