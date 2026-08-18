@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import openai_fallback
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
