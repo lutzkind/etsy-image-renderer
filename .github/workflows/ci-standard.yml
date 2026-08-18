@@ -25,18 +25,19 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - name: Run declared setup
-        id: setup
-        shell: bash
-        run: |
-          echo 'has_setup=false' >> "$GITHUB_OUTPUT"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
       - name: Run declared checks
         shell: bash
         run: |
           set -euo pipefail
           git diff --check
-          python3 -m py_compile app.py openai_fallback.py
-          python3 -m pytest -q
+          python -m py_compile app.py openai_fallback.py
+          pytest -q
       - name: Clean generated workspace data
         if: always()
         shell: bash
