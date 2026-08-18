@@ -80,13 +80,13 @@ def test_generate_image_uses_responses_image_tool(tmp_path, monkeypatch):
 
     assert data == _png()
     assert mime == "image/png"
-    assert model == "gpt-image-1.5"
+    assert model == "gpt-image-2"
     assert seen["url"].endswith("/responses")
     assert seen["headers"]["Authorization"] == "Bearer test-key"
     assert seen["json"]["tool_choice"] == {"type": "image_generation"}
     tool = seen["json"]["tools"][0]
     assert tool["type"] == "image_generation"
-    assert tool["model"] == "gpt-image-1.5"
+    assert tool["model"] == "gpt-image-2"
     assert tool["action"] == "edit"
     assert tool["input_fidelity"] == "high"
     assert seen["json"]["input"][0]["content"][1]["image_url"].startswith("data:image/png;base64,")
@@ -102,7 +102,7 @@ def test_open_quota_circuit_bypasses_codex(tmp_path, monkeypatch):
         called["prompt"] = prompt
         called["inputs"] = inputs
         called["timeout"] = timeout
-        return _png(), "image/png", "gpt-image-1.5"
+        return _png(), "image/png", "gpt-image-2"
 
     monkeypatch.setattr(openai_fallback, "generate_image", fake_generate)
     run = renderer._run_codex_app_server(
