@@ -988,6 +988,11 @@ def _render_deterministic(request: RenderRequest, workspace: Path, inputs: list[
     scene_outputs = _new_outputs(workspace, before, inputs)
     scene_outputs.extend(path for path in scene_run.saved_paths if path not in scene_outputs)
     if scene_run.returncode != 0:
+        combined = ((scene_run.stderr or "") + "\n" + (scene_run.stdout or "")).lower()
+        if "openai_image_fallback_failed" in combined:
+            raise RuntimeError("openai_image_fallback_failed")
+        if openai_fallback.codex_quota_exhausted(combined):
+            raise RuntimeError("codex_quota_unavailable")
         raise RuntimeError("codex_scene_preparation_failed")
     saved_candidates = [path for path in scene_run.saved_paths if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
     candidates = saved_candidates or [path for path in scene_outputs if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
