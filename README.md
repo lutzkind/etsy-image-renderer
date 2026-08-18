@@ -1,8 +1,12 @@
 # etsy-codex-renderer
 
-Private local Codex image renderer for the Windmill Etsy automation pipeline. Codex is the sole image renderer and owns raster generation only. Windmill owns state, QA, approval, deterministic compositing, and final listing decisions.
+Private image renderer for the Windmill Etsy automation pipeline. Codex remains the primary raster renderer. When Codex reports confirmed subscription/quota exhaustion, the service can fall back to the official OpenAI Responses API image-generation tool. Windmill owns state, QA, approval, deterministic compositing, and final listing decisions.
 
-`POST /render` and `POST /render-async` accept the versioned `luxlm-render-contract-v2`.
+The paid API fallback is intentionally quota-only: generic temporary `429` or rate-limit errors do not trigger it. After confirmed quota exhaustion, a short circuit breaker (30 minutes by default) can send subsequent image renders directly to the API until Codex is retried. If `OPENAI_API_KEY` is absent, the previous `codex_quota_unavailable` behavior is preserved.
+
+Default fallback configuration is `gpt-5` for Responses orchestration and `gpt-image-1.5` for image generation, with high input fidelity when reference images are present. These defaults are configurable through `OPENAI_IMAGE_FALLBACK_MODEL`, `OPENAI_IMAGE_FALLBACK_IMAGE_MODEL`, `OPENAI_IMAGE_FALLBACK_QUALITY`, `OPENAI_IMAGE_FALLBACK_SIZE`, `OPENAI_IMAGE_FALLBACK_TIMEOUT_SECONDS`, and `CODEX_QUOTA_CIRCUIT_SECONDS`.
+
+`POST /render` and `POST /render-async` accept the versioned `luxlm-render-contract-v3`.
 
 ## Modes
 
