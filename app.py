@@ -602,6 +602,44 @@ class _CodexRun:
     saved_paths: tuple[Path, ...] = ()
 
 
+def _api_fallback_prompt(prompt: str) -> str:
+    value = str(prompt)
+    for old in (
+        "$imagegen\n",
+        "Do not call an external image API, ",
+        "do not call an external image API, ",
+        "Do not run image_gen.py, ",
+        "do not run image_gen.py, ",
+        "Copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it.",
+        "then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it.",
+        "Return only a brief confirmation after generating the image.",
+    ):
+        value = value.replace(old, "")
+    return (
+        "Generate exactly one raster with the provided image-generation tool. "
+        "Do not return prose instead of the image.\n\n" + value.strip()
+    )
+
+
+def _run_openai_api_fallback(workspace: Path, inputs: list[Path], prompt: str, timeout: int) -> _CodexRun:
+    try:
+        data, mime, model = openai_fallback.generate_image(_api_fallback_prompt(prompt), inputs, timeout)
+    except openai_fallback.OpenAIImageFallbackError as exc:
+        return _CodexRun(1, "", f"openai_image_fallback_failed:{exc}")
+    except Exception as exc:
+        return _CodexRun(1, "", f"openai_image_fallback_failed:{type(exc).__name__}")
+    suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime)
+    if not suffix:
+        return _CodexRun(1, "", "openai_image_fallback_failed:unsupported_mime")
+    output = workspace / f"openai-fallback-output{suffix}"
+    output.write_bytes(data)
+    event = json.dumps({
+        "type": "item.completed",
+        "item": {"type": "image_generation_call", "provider": "openai-api", "model": model},
+    })
+    return _CodexRun(0, event, "openai_api_fallback", (output,))
+
+
 def _codex_app_server_command() -> list[str]:
     return [
         "codex", "app-server", "--enable", "image_generation", "--listen", "stdio://",
