@@ -1062,7 +1062,9 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
             outputs.extend(path for path in result.saved_paths if path not in outputs)
             if result.returncode != 0:
                 combined = ((result.stderr or "") + "\n" + (result.stdout or "")).lower()
-                if any(term in combined for term in ("usage limit", "quota", "too many requests", "429")):
+                if "openai_image_fallback_failed" in combined:
+                    raise RuntimeError("openai_image_fallback_failed")
+                if openai_fallback.codex_quota_exhausted(combined):
                     raise RuntimeError("codex_quota_unavailable")
                 if any(term in combined for term in ("not logged in", "unauthorized", "401")):
                     raise RuntimeError("codex_authentication_failed")
