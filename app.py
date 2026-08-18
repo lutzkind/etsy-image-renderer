@@ -709,6 +709,8 @@ def _codex_app_server_inputs(prompt: str, inputs: list[Path]) -> list[dict[str, 
 
 
 def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, timeout: int) -> _CodexRun:
+    if openai_fallback.configured() and openai_fallback.quota_circuit_open():
+        return _run_openai_api_fallback(workspace, inputs, prompt, timeout)
     if not _codex_skill_path().is_file():
         return _CodexRun(1, "", "image_generation_skill_missing")
 
