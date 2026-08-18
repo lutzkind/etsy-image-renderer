@@ -35,6 +35,8 @@ jobs:
         run: |
           set -euo pipefail
           git diff --check
+          python3 -m py_compile app.py openai_fallback.py
+          python3 -m pytest -q
       - name: Clean generated workspace data
         if: always()
         shell: bash
