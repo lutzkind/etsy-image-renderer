@@ -29,10 +29,10 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 CONTRACT_VERSION = "luxlm-render-contract-v3"
-IMAGE_PIPELINE_VERSION = "1.5.0"
-FRESH_PROOF_SCHEMA_VERSION = "codex-image-generation-proof-v1"
+IMAGE_PIPELINE_VERSION = "1.6.0"
+FRESH_PROOF_SCHEMA_VERSION = "image-generation-proof-v2"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
 MAX_INPUT_BYTES = 16 * 1024 * 1024
