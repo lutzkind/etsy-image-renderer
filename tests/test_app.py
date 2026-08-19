@@ -481,11 +481,25 @@ def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     assert 'chown "$runtime_uid:0" "$codex_home"' in entrypoint_text
     assert 'chmod 0770 "$codex_home"' in entrypoint_text
     assert 'chmod -R a+rwX "$codex_home"' in entrypoint_text
+    assert '[ -f "$auth_source" ]' in entrypoint_text
+    assert "continuing so the configured API fallback can serve renders" in entrypoint_text
     assert "codex-system-skills/imagegen" in entrypoint_text
     assert 'chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills"' in entrypoint_text
     assert "codex-system-skills/imagegen" in dockerfile_text
     assert "chown 10001:0 /tmp/etsy-codex-home" in dockerfile_text
     assert "chmod 0770 /tmp/etsy-codex-home" in dockerfile_text
+
+
+def test_readiness_accepts_configured_api_fallback_without_codex_auth(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
+    monkeypatch.setattr(renderer.shutil, "which", lambda name: None)
+
+    status = renderer.readiness()
+
+    assert status["ready"] is True
+    assert status["api_fallback_configured"] is True
+    assert status["authenticated"] is False
 
 
 def test_render_endpoint_requires_auth(monkeypatch):
