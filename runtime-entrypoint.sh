@@ -33,10 +33,13 @@ if [ "$(id -u)" -eq 0 ]; then
     # otherwise the refresh removes the vendored skill and fails closed.
     chown -R "$runtime_uid:$runtime_gid" "$codex_home/skills"
     if [ -n "$auth_source" ]; then
-        test -r "$auth_source"
-        cp "$auth_source" "$codex_home/auth.json"
-        chown "$runtime_uid:$runtime_gid" "$codex_home/auth.json"
-        chmod 0600 "$codex_home/auth.json"
+        if [ -f "$auth_source" ] && [ -r "$auth_source" ]; then
+            cp "$auth_source" "$codex_home/auth.json"
+            chown "$runtime_uid:$runtime_gid" "$codex_home/auth.json"
+            chmod 0600 "$codex_home/auth.json"
+        else
+            echo "Codex auth source is not a readable regular file; continuing so the configured API fallback can serve renders." >&2
+        fi
     fi
     if [ -n "$render_data_dir" ] && [ -d "$render_data_dir" ]; then
         chown -R "$runtime_uid:$runtime_gid" "$render_data_dir"
