@@ -858,13 +858,21 @@ def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, time
         "\n".join(stderr_chunks),
         _safe_saved_paths("\n".join(stdout_lines), workspace, inputs),
     )
-    if result.returncode != 0 and openai_fallback.codex_quota_exhausted((result.stderr or "") + "\n" + (result.stdout or "")):
+    failure_text = (result.stderr or "") + "\n" + (result.stdout or "")
+    if result.returncode != 0 and openai_fallback.codex_quota_exhausted(failure_text):
         openai_fallback.mark_codex_quota_exhausted()
         if openai_fallback.configured():
             fallback = _run_openai_api_fallback(workspace, inputs, prompt, timeout)
             if fallback.returncode == 0:
                 return fallback
             return _CodexRun(1, "", f"{fallback.stderr}\ncodex_quota_confirmed")
+    if result.returncode != 0 and openai_fallback.configured() and any(
+        marker in failure_text.lower() for marker in ("not logged in", "unauthorized", "authentication failed", "401")
+    ):
+        fallback = _run_openai_api_fallback(workspace, inputs, prompt, timeout)
+        if fallback.returncode == 0:
+            return fallback
+        return _CodexRun(1, "", f"{fallback.stderr}\ncodex_authentication_failed")
     return result
 
 
