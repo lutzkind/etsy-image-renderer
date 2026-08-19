@@ -895,12 +895,13 @@ def readiness() -> dict[str, Any]:
                     break
         except (OSError, subprocess.SubprocessError):
             pass
+    api_fallback_configured = openai_fallback.configured()
     return {
-        "ready": bool(binary and authenticated and image_generation and _token()),
+        "ready": bool(_token() and (api_fallback_configured or (binary and authenticated and image_generation))),
         "binary": bool(binary), "version": version, "authenticated": authenticated,
         "image_generation": image_generation, "token_configured": bool(_token()),
         "renderer": "codex-local", "app_version": APP_VERSION, "contract_version": CONTRACT_VERSION,
-        "api_fallback_configured": openai_fallback.configured(),
+        "api_fallback_configured": api_fallback_configured,
         "api_fallback_model": openai_fallback.responses_model(),
         "api_fallback_image_model": openai_fallback.image_model(),
         "codex_quota_circuit_open": openai_fallback.quota_circuit_open(),
