@@ -120,6 +120,27 @@ def test_open_quota_circuit_bypasses_codex(tmp_path, monkeypatch):
     assert "brief confirmation" not in called["prompt"]
 
 
+def test_missing_codex_auth_uses_configured_api_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    called = {}
+
+    def fake_generate(prompt, inputs, timeout):
+        called["prompt"] = prompt
+        called["inputs"] = inputs
+        called["timeout"] = timeout
+        return _png(), "image/png", "gpt-image-2"
+
+    monkeypatch.setattr(openai_fallback, "generate_image", fake_generate)
+    run = renderer._run_codex_app_server(tmp_path, [], "$imagegen\nGenerate one image.", 60)
+
+    assert run.returncode == 0
+    assert run.stderr == "openai_api_fallback"
+    assert run.saved_paths[0].read_bytes() == _png()
+    assert "image_generation_call" in run.stdout
+    assert called["timeout"] == 60
+
+
 def test_api_fallback_requires_key(tmp_path):
     run = renderer._run_openai_api_fallback(tmp_path, [], "render", 60)
     assert run.returncode == 1
