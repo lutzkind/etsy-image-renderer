@@ -3,7 +3,7 @@ FROM node:22-bookworm-slim
 ARG CODEX_VERSION=0.145.0
 ENV PYTHONUNBUFFERED=1 \
     CODEX_HOME=/tmp/etsy-codex-home \
-    CODEX_AUTH_SOURCE=/run/secrets/codex-auth.json \
+    CODEX_AUTH_SOURCE=/run/secrets/codex-session/auth.json \
     RENDER_DATA_DIR=/data
 
 RUN apt-get update \

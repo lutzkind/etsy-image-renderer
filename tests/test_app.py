@@ -475,6 +475,7 @@ def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     assert "/root/.codex:/run/secrets/codex-session:ro" in compose_text
     assert "/root/.codex/auth.json:/run/secrets" not in compose_text
     assert "CODEX_HOME=/tmp/etsy-codex-home" in compose_text
+    assert "CODEX_AUTH_SOURCE=/run/secrets/codex-session/auth.json" in dockerfile_text
     assert "setpriv" in entrypoint_text
     assert "auth_source=/root/.codex/auth.json" in entrypoint_text
     assert 'chown -R "$runtime_uid:$runtime_gid" "$render_data_dir"' in entrypoint_text
