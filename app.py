@@ -29,9 +29,9 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 CONTRACT_VERSION = "luxlm-render-contract-v3"
-IMAGE_PIPELINE_VERSION = "1.6.0"
+IMAGE_PIPELINE_VERSION = "1.7.0"
 FRESH_PROOF_SCHEMA_VERSION = "image-generation-proof-v2"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
@@ -956,6 +956,10 @@ def _fit_artwork(artwork: Image.Image, box: tuple[int, int, int, int]) -> tuple[
 def _deterministic_composite(request: RenderRequest, scene: Image.Image, artwork: Image.Image) -> tuple[bytes, str]:
     """Compose an Image 2-prepared scene and the approved artwork without generative editing."""
     canvas_size = (1536, 1024)
+    presentation_mode = "frame"
+    if request.mode == "deterministic_lifestyle":
+        requested_mode = str(request.layout_contract.get("presentation_mode") or "frame").strip().lower()
+        presentation_mode = requested_mode if requested_mode in {"screen", "editorial", "frame"} else "frame"
     if request.mode == "deterministic_frame":
         # The Codex preparation call is required for capability and style
         # variation, but a frame-only hero must not leak room or screen cues
@@ -966,26 +970,30 @@ def _deterministic_composite(request: RenderRequest, scene: Image.Image, artwork
     box = _deterministic_artwork_box(request, artwork.size)
     fitted, placed = _fit_artwork(artwork, box)
     left, top, right, bottom = placed
+    canvas = canvas.convert("RGBA")
 
-    shadow = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-    shadow_draw = ImageDraw.Draw(shadow)
-    shadow_draw.rectangle((left + 12, top + 14, right + 12, bottom + 14), fill=(0, 0, 0, 90))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(12))
-    canvas = Image.alpha_composite(canvas.convert("RGBA"), shadow)
+    if presentation_mode != "editorial":
+        shadow = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow)
+        shadow_draw.rectangle((left + 12, top + 14, right + 12, bottom + 14), fill=(0, 0, 0, 90))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(12))
+        canvas = Image.alpha_composite(canvas, shadow)
 
-    frame_padding = 16
-    frame_left = max(0, left - frame_padding)
-    frame_top = max(0, top - frame_padding)
-    frame_right = min(canvas_size[0] - 1, right + frame_padding)
-    frame_bottom = min(canvas_size[1] - 1, bottom + frame_padding)
-    frame = ImageDraw.Draw(canvas)
-    frame.rectangle((frame_left, frame_top, frame_right, frame_bottom), fill=(34, 34, 31, 255), outline=(224, 218, 201, 255), width=5)
+        frame_padding = 16
+        frame_left = max(0, left - frame_padding)
+        frame_top = max(0, top - frame_padding)
+        frame_right = min(canvas_size[0] - 1, right + frame_padding)
+        frame_bottom = min(canvas_size[1] - 1, bottom + frame_padding)
+        frame = ImageDraw.Draw(canvas)
+        frame.rectangle((frame_left, frame_top, frame_right, frame_bottom), fill=(34, 34, 31, 255), outline=(224, 218, 201, 255), width=5)
     canvas.alpha_composite(fitted.convert("RGBA"), (left, top))
 
     output = io.BytesIO()
     canvas.convert("RGB").save(output, format="PNG", optimize=True)
     return output.getvalue(), json.dumps({
         "mode": "deterministic_raster_composite",
+        "presentation_mode": presentation_mode,
+        "frame_inserted": presentation_mode != "editorial",
         "artwork_box": [left, top, right, bottom],
         "artwork_source_size": [artwork.width, artwork.height],
         "artwork_output_size": [fitted.width, fitted.height],

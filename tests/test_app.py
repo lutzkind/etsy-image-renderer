@@ -115,7 +115,7 @@ def test_private_urls_are_rejected(monkeypatch):
 
 
 def test_mode_contracts_keep_legacy_counts_and_support_structured_modes():
-    assert renderer.APP_VERSION == "1.11.0"
+    assert renderer.APP_VERSION == "1.12.0"
     assert renderer.EXPECTED_INPUTS == {
         "minimal_frame": 1, "lifestyle": 2, "orientation": 1,
         "deterministic_frame": 1, "deterministic_lifestyle": 2,
@@ -357,6 +357,31 @@ def test_deterministic_lifestyle_contract_requires_immutable_artwork_and_geometr
     ]
     with pytest.raises((ValueError, ValidationError), match="immutable"):
         renderer.RenderRequest.model_validate(invalid)
+
+
+def test_deterministic_editorial_lifestyle_omits_frame_but_preserves_uniform_fit():
+    request = renderer.RenderRequest.model_validate({
+        "mode": "deterministic_lifestyle",
+        "input_urls": ["https://example.com/room.jpg", "https://example.com/art.jpg"],
+        "expected_input_count": 2,
+        "asset_roles": [
+            {"role": "source_room_reference", "url": "https://example.com/room.jpg", "transform_allowed": True},
+            {"role": "approved_listing_artwork", "url": "https://example.com/art.jpg", "exact_pixel_preservation": True, "transform_allowed": False},
+        ],
+        "layout_contract": {"artwork_box_percent": [26, 10, 74, 90], "presentation_mode": "editorial"},
+        "generation_instructions": {"prepare_scene_with_codex": True},
+    })
+    data, proof = renderer._deterministic_composite(
+        request,
+        Image.new("RGB", (1536, 1024), (210, 220, 230)),
+        Image.new("RGB", (300, 600), (220, 80, 40)),
+    )
+    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    proof_payload = json.loads(proof)
+    assert proof_payload["presentation_mode"] == "editorial"
+    assert proof_payload["frame_inserted"] is False
+    assert proof_payload["transform"] == "uniform_contain"
+    assert renderer._role_contract(request)["output_kind"] == "deterministic_composite"
 
 
 def test_deterministic_composite_preserves_artwork_aspect_ratio():
