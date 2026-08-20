@@ -471,8 +471,9 @@ def test_container_runtime_is_sandboxed_and_auth_mount_is_read_only():
     assert "read_only: true" in compose_text
     assert "cap_drop: [ALL]" in compose_text
     assert "no-new-privileges:true" in compose_text
-    assert "/run/secrets/codex-auth.json:ro" in compose_text
-    assert ":/root/.codex/auth.json" not in compose_text
+    assert "CODEX_AUTH_SOURCE=/run/secrets/codex-session/auth.json" in compose_text
+    assert "/root/.codex:/run/secrets/codex-session:ro" in compose_text
+    assert "/root/.codex/auth.json:/run/secrets" not in compose_text
     assert "CODEX_HOME=/tmp/etsy-codex-home" in compose_text
     assert "setpriv" in entrypoint_text
     assert "auth_source=/root/.codex/auth.json" in entrypoint_text

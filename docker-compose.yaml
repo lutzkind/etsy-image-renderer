@@ -15,7 +15,11 @@ services:
       - SERVICE_URL_ETSY_CODEX_RENDERER_8080=/
       - ETSY_CODEX_RENDERER_TOKEN
       - CODEX_HOME=/tmp/etsy-codex-home
-      - CODEX_AUTH_SOURCE=/run/secrets/codex-auth.json
+      # Mount the persistent server Codex home as a directory. Codex refreshes
+      # auth.json with atomic replacement; a single-file bind would keep the
+      # renderer pinned to the old inode (or cause Docker to create a
+      # directory when the source is temporarily absent).
+      - CODEX_AUTH_SOURCE=/run/secrets/codex-session/auth.json
       - RENDER_DATA_DIR=/data
       - CODEX_RENDER_TIMEOUT_SECONDS
       - OPENAI_API_KEY
@@ -30,7 +34,7 @@ services:
       - CODEX_QUOTA_CIRCUIT_SECONDS
     volumes:
       - renderer-data:/data
-      - /root/.codex/auth.json:/run/secrets/codex-auth.json:ro
+      - /root/.codex:/run/secrets/codex-session:ro
     expose:
       - "8080"
     networks:
