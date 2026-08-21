@@ -38,7 +38,7 @@ if [ "$(id -u)" -eq 0 ]; then
             chown "$runtime_uid:$runtime_gid" "$codex_home/auth.json"
             chmod 0600 "$codex_home/auth.json"
         else
-            echo "Codex auth source is not a readable regular file; continuing so the configured API fallback can serve renders." >&2
+            echo "Codex auth source is not a readable regular file; refusing customer-facing renders." >&2
         fi
     fi
     if [ -n "$render_data_dir" ] && [ -d "$render_data_dir" ]; then

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import io
 import ipaddress
 import json
 import os
@@ -22,16 +21,14 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-import openai_fallback
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.12.0"
-CONTRACT_VERSION = "luxlm-render-contract-v3"
-IMAGE_PIPELINE_VERSION = "1.7.0"
+APP_VERSION = "1.13.0"
+CONTRACT_VERSION = "luxlm-render-contract-v4-codex-final-raster"
+IMAGE_PIPELINE_VERSION = "1.8.0-codex-only-final-raster"
 FRESH_PROOF_SCHEMA_VERSION = "image-generation-proof-v2"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
@@ -42,11 +39,7 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 MODE_CONTRACTS: dict[str, dict[str, Any]] = {
     "minimal_frame": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": False},
     "lifestyle": {"expected_input_count": 2, "output_kind": "final_asset", "generated_text": False},
-    "deterministic_frame": {"expected_input_count": 1, "output_kind": "deterministic_composite", "generated_text": False},
-    "deterministic_lifestyle": {"expected_input_count": 2, "output_kind": "deterministic_composite", "generated_text": False},
     "orientation": {"expected_input_count": 1, "output_kind": "final_asset", "generated_text": False},
-    "before_after_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
-    "information_card": {"expected_input_count": 2, "output_kind": "decorative_asset", "generated_text": False},
     "decorative_asset": {"expected_input_count": None, "output_kind": "decorative_asset", "generated_text": False},
     "designed_card": {"expected_input_count": None, "output_kind": "final_asset", "generated_text": True},
 }
@@ -202,27 +195,6 @@ class RenderRequest(BaseModel):
                     raise ValueError("designed_card_selector_duplicate_option")
                 if dimension == "lettering" and not str(selector_spec.get("sample_text") or "").strip():
                     raise ValueError("designed_card_selector_sample_missing")
-        elif self.mode in {"deterministic_frame", "deterministic_lifestyle"}:
-            if len(self.asset_roles) != len(self.input_urls):
-                raise ValueError("deterministic_composite_asset_roles_required")
-            if not self.asset_roles:
-                raise ValueError("deterministic_composite_asset_roles_required")
-            artwork_role = self.asset_roles[-1]
-            if artwork_role.role not in {"approved_listing_artwork", "listing_artwork"}:
-                raise ValueError("deterministic_composite_artwork_role_required")
-            if not artwork_role.exact_pixel_preservation or artwork_role.transform_allowed:
-                raise ValueError("deterministic_composite_artwork_must_be_immutable")
-            if self.generation_instructions.get("prepare_scene_with_codex") is not True:
-                raise ValueError("deterministic_composite_requires_scene_preparation")
-            box = self.layout_contract.get("artwork_box_percent")
-            if not isinstance(box, list) or len(box) != 4:
-                raise ValueError("deterministic_composite_artwork_box_required")
-            try:
-                left, top, right, bottom = [float(value) for value in box]
-            except (TypeError, ValueError) as exc:
-                raise ValueError("deterministic_composite_artwork_box_invalid") from exc
-            if not (0 <= left < right <= 100 and 0 <= top < bottom <= 100):
-                raise ValueError("deterministic_composite_artwork_box_invalid")
         else:
             if self.asset_roles:
                 role_urls = [role.url.strip() for role in self.asset_roles]
@@ -410,29 +382,26 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
             instruction = "Create one cohesive, premium editorial Etsy personalization selector card with the supplied artwork as the visual authority."
     else:
         common = (
-            "$imagegen\nBefore writing any textual response, invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. Generate exactly one polished raster image, then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it. This is a decorative visual asset, not the final typography compositor. Never generate words, letters, numbers, pseudo-lettering, signatures, logos, watermarks, blank caption sheets, paper mats, empty label regions, marketing panels, generic information panels, prices, badges, or invented claims. Do not copy competitor branding, exact coordinates, distinctive protected elements, or source-image text. Preserve any role marked exact pixel preservation; the final system may composite that raster deterministically afterward."
+            "$imagegen\nBefore writing any textual response, invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. "
+            "If the image-generation tool is unavailable, terminate with a nonzero error instead of returning prose. "
+            "Do not call an external image API, do not run image_gen.py, and do not create SVG, HTML, CSS, placeholder art, or a programmatic drawing. "
+            "Generate exactly one complete customer-facing Etsy raster and copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it. "
+            "The supplied listing artwork is authoritative: preserve its subject, lettering, proportions, texture, palette, and complete source crop. "
+            "When the source shows a complete person, pet, house, vehicle, or other primary subject, keep the complete subject visible with comfortable margins. "
+            "Do not invent, redraw, mutate, crop, stretch, or replace the artwork. Do not add logos, watermarks, signatures, prices, badges, or unsupported claims. "
+            "The final raster must be authored by the image-generation tool; no other process may draw, type, paste, frame, compose, or lay out customer-facing pixels."
         )
         instruction = {
-            "deterministic_frame": (
-                "Prepare an elegant minimal EMPTY presentation scene only. Do not include the supplied artwork, any subject, text, lettering, or a second image. "
-                "The final service inserts the approved artwork raster deterministically after this scene is generated."
-            ),
-            "deterministic_lifestyle": (
-                "Prepare an EMPTY lifestyle room scene only. Preserve the room atmosphere and create a tasteful clear artwork placement area, "
-                "but do not include, redraw, repaint, warp, or describe the supplied artwork. The final service inserts the approved artwork raster deterministically."
-            ),
             "minimal_frame": (
-                "Create a restrained premium ecommerce artwork-in-frame hero around the exact finished artwork. "
+                "Create the complete restrained premium ecommerce artwork-in-frame hero around the exact finished artwork. "
                 "This mode is frame-only: show exactly one physical neutral frame with a clearly visible rigid frame edge "
                 "on all four sides and the complete artwork inside it. Do not create a flat bordered raster, poster sheet, "
                 "digital screen, monitor, laptop, tablet, device, room scene, wall scene, desk, table, shelf, studio interior, "
                 "lifestyle environment, room decor, props, or Unsplash-style stock-photo scene. The output must read as a "
                 "clean isolated frame mockup at Etsy thumbnail size, not as a screen presentation or an unframed artwork."
             ),
-            "lifestyle": "Use the room as the physical context and the second asset as the exact artwork target; preserve the room and do not redraw the artwork.",
+            "lifestyle": "Generate the complete editorial lifestyle raster using the supplied room as reference material and the supplied artwork as the listing-specific visual authority. Keep the artwork clearly visible and dominant, use restrained decor, and do not serve the untouched room reference.",
             "orientation": "Create a clean presentation of the exact complete artwork without cropping important architecture or subject content.",
-            "before_after_card": "Create a visual-only before/after supporting asset; do not add text or a generic information panel.",
-            "information_card": "Create a visual-only supporting asset; do not add text or a generic information panel. Final composition and wording are deterministic outside this service.",
             "decorative_asset": f"Create only the requested decorative visual treatment for module {request.module or 'unspecified'}; obey the supplied layout and asset roles.",
         }[request.mode]
     compact_context = " ".join((request.context or "").split())[:700]
@@ -602,44 +571,6 @@ class _CodexRun:
     saved_paths: tuple[Path, ...] = ()
 
 
-def _api_fallback_prompt(prompt: str) -> str:
-    value = str(prompt)
-    for old in (
-        "$imagegen\n",
-        "Do not call an external image API, ",
-        "do not call an external image API, ",
-        "Do not run image_gen.py, ",
-        "do not run image_gen.py, ",
-        "Copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it.",
-        "then copy the exact generated raster to ./rendered-output.png without redrawing or re-encoding it.",
-        "Return only a brief confirmation after generating the image.",
-    ):
-        value = value.replace(old, "")
-    return (
-        "Generate exactly one raster with the provided image-generation tool. "
-        "Do not return prose instead of the image.\n\n" + value.strip()
-    )
-
-
-def _run_openai_api_fallback(workspace: Path, inputs: list[Path], prompt: str, timeout: int) -> _CodexRun:
-    try:
-        data, mime, model = openai_fallback.generate_image(_api_fallback_prompt(prompt), inputs, timeout)
-    except openai_fallback.OpenAIImageFallbackError as exc:
-        return _CodexRun(1, "", f"openai_image_fallback_failed:{exc}")
-    except Exception as exc:
-        return _CodexRun(1, "", f"openai_image_fallback_failed:{type(exc).__name__}")
-    suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime)
-    if not suffix:
-        return _CodexRun(1, "", "openai_image_fallback_failed:unsupported_mime")
-    output = workspace / f"openai-fallback-output{suffix}"
-    output.write_bytes(data)
-    event = json.dumps({
-        "type": "item.completed",
-        "item": {"type": "image_generation_call", "provider": "openai-api", "model": model},
-    })
-    return _CodexRun(0, event, "openai_api_fallback", (output,))
-
-
 def _codex_app_server_command() -> list[str]:
     return [
         "codex", "app-server", "--enable", "image_generation", "--listen", "stdio://",
@@ -709,8 +640,6 @@ def _codex_app_server_inputs(prompt: str, inputs: list[Path]) -> list[dict[str, 
 
 
 def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, timeout: int) -> _CodexRun:
-    if openai_fallback.configured() and (openai_fallback.quota_circuit_open() or not (_codex_home() / "auth.json").is_file()):
-        return _run_openai_api_fallback(workspace, inputs, prompt, timeout)
     if not _codex_skill_path().is_file():
         return _CodexRun(1, "", "image_generation_skill_missing")
 
@@ -859,20 +788,6 @@ def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, time
         _safe_saved_paths("\n".join(stdout_lines), workspace, inputs),
     )
     failure_text = (result.stderr or "") + "\n" + (result.stdout or "")
-    if result.returncode != 0 and openai_fallback.codex_quota_exhausted(failure_text):
-        openai_fallback.mark_codex_quota_exhausted()
-        if openai_fallback.configured():
-            fallback = _run_openai_api_fallback(workspace, inputs, prompt, timeout)
-            if fallback.returncode == 0:
-                return fallback
-            return _CodexRun(1, "", f"{fallback.stderr}\ncodex_quota_confirmed")
-    if result.returncode != 0 and openai_fallback.configured() and any(
-        marker in failure_text.lower() for marker in ("not logged in", "unauthorized", "authentication failed", "401")
-    ):
-        fallback = _run_openai_api_fallback(workspace, inputs, prompt, timeout)
-        if fallback.returncode == 0:
-            return fallback
-        return _CodexRun(1, "", f"{fallback.stderr}\ncodex_authentication_failed")
     return result
 
 
@@ -895,16 +810,13 @@ def readiness() -> dict[str, Any]:
                     break
         except (OSError, subprocess.SubprocessError):
             pass
-    api_fallback_configured = openai_fallback.configured()
     return {
-        "ready": bool(_token() and (api_fallback_configured or (binary and authenticated and image_generation))),
+        "ready": bool(_token() and binary and authenticated and image_generation),
         "binary": bool(binary), "version": version, "authenticated": authenticated,
         "image_generation": image_generation, "token_configured": bool(_token()),
         "renderer": "codex-local", "app_version": APP_VERSION, "contract_version": CONTRACT_VERSION,
-        "api_fallback_configured": api_fallback_configured,
-        "api_fallback_model": openai_fallback.responses_model(),
-        "api_fallback_image_model": openai_fallback.image_model(),
-        "codex_quota_circuit_open": openai_fallback.quota_circuit_open(),
+        "customer_facing_generation": "codex_image_generation_only",
+        "local_visual_compositing_allowed": False,
     }
 
 
@@ -927,109 +839,6 @@ def _claim_request(request_hash: str) -> None:
 def _release_failed_request(request_hash: str) -> None:
     with _REQUEST_DIGESTS_LOCK:
         _REQUEST_DIGESTS.pop(request_hash, None)
-
-
-def _deterministic_artwork_box(request: RenderRequest, artwork_size: tuple[int, int]) -> tuple[int, int, int, int]:
-    raw_box = request.layout_contract.get("artwork_box_percent") or [24, 10, 76, 90]
-    left, top, right, bottom = [float(value) for value in raw_box]
-    canvas_width, canvas_height = (1536, 1024)
-    box_left = max(0, min(canvas_width - 1, round(canvas_width * left / 100)))
-    box_top = max(0, min(canvas_height - 1, round(canvas_height * top / 100)))
-    box_right = max(box_left + 1, min(canvas_width, round(canvas_width * right / 100)))
-    box_bottom = max(box_top + 1, min(canvas_height, round(canvas_height * bottom / 100)))
-    source_width, source_height = artwork_size
-    if source_width <= 0 or source_height <= 0:
-        raise ValueError("deterministic_composite_artwork_dimensions_invalid")
-    return box_left, box_top, box_right, box_bottom
-
-
-def _fit_artwork(artwork: Image.Image, box: tuple[int, int, int, int]) -> tuple[Image.Image, tuple[int, int, int, int]]:
-    left, top, right, bottom = box
-    available_width = max(1, right - left)
-    available_height = max(1, bottom - top)
-    fitted = ImageOps.contain(artwork.convert("RGB"), (available_width, available_height), method=Image.Resampling.LANCZOS)
-    fitted_left = left + (available_width - fitted.width) // 2
-    fitted_top = top + (available_height - fitted.height) // 2
-    return fitted, (fitted_left, fitted_top, fitted_left + fitted.width, fitted_top + fitted.height)
-
-
-def _deterministic_composite(request: RenderRequest, scene: Image.Image, artwork: Image.Image) -> tuple[bytes, str]:
-    """Compose an Image 2-prepared scene and the approved artwork without generative editing."""
-    canvas_size = (1536, 1024)
-    presentation_mode = "frame"
-    if request.mode == "deterministic_lifestyle":
-        requested_mode = str(request.layout_contract.get("presentation_mode") or "frame").strip().lower()
-        presentation_mode = requested_mode if requested_mode in {"screen", "editorial", "frame"} else "frame"
-    if request.mode == "deterministic_frame":
-        # The Codex preparation call is required for capability and style
-        # variation, but a frame-only hero must not leak room or screen cues
-        # from that preparation into the final customer-facing raster.
-        canvas = Image.new("RGB", canvas_size, (239, 237, 230))
-    else:
-        canvas = ImageOps.fit(scene.convert("RGB"), canvas_size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-    box = _deterministic_artwork_box(request, artwork.size)
-    fitted, placed = _fit_artwork(artwork, box)
-    left, top, right, bottom = placed
-    canvas = canvas.convert("RGBA")
-
-    if presentation_mode != "editorial":
-        shadow = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-        shadow_draw = ImageDraw.Draw(shadow)
-        shadow_draw.rectangle((left + 12, top + 14, right + 12, bottom + 14), fill=(0, 0, 0, 90))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(12))
-        canvas = Image.alpha_composite(canvas, shadow)
-
-        frame_padding = 16
-        frame_left = max(0, left - frame_padding)
-        frame_top = max(0, top - frame_padding)
-        frame_right = min(canvas_size[0] - 1, right + frame_padding)
-        frame_bottom = min(canvas_size[1] - 1, bottom + frame_padding)
-        frame = ImageDraw.Draw(canvas)
-        frame.rectangle((frame_left, frame_top, frame_right, frame_bottom), fill=(34, 34, 31, 255), outline=(224, 218, 201, 255), width=5)
-    canvas.alpha_composite(fitted.convert("RGBA"), (left, top))
-
-    output = io.BytesIO()
-    canvas.convert("RGB").save(output, format="PNG", optimize=True)
-    return output.getvalue(), json.dumps({
-        "mode": "deterministic_raster_composite",
-        "presentation_mode": presentation_mode,
-        "frame_inserted": presentation_mode != "editorial",
-        "artwork_box": [left, top, right, bottom],
-        "artwork_source_size": [artwork.width, artwork.height],
-        "artwork_output_size": [fitted.width, fitted.height],
-        "aspect_ratio_preserved": abs((artwork.width / artwork.height) - (fitted.width / fitted.height)) < 0.0001,
-        "transform": "uniform_contain",
-        "artwork_content_source": "approved_input_raster",
-    }, sort_keys=True)
-
-
-def _render_deterministic(request: RenderRequest, workspace: Path, inputs: list[Path], before: dict[str, tuple[int, int]]) -> tuple[bytes, str, str, list[Path]]:
-    scene_inputs = inputs[:-1] if request.mode == "deterministic_lifestyle" else []
-    scene_run = _run_codex_app_server(workspace, scene_inputs, _prompt(request), max(60, min(int(os.environ.get("CODEX_RENDER_TIMEOUT_SECONDS", "900")), 1800)))
-    scene_outputs = _new_outputs(workspace, before, inputs)
-    scene_outputs.extend(path for path in scene_run.saved_paths if path not in scene_outputs)
-    if scene_run.returncode != 0:
-        combined = ((scene_run.stderr or "") + "\n" + (scene_run.stdout or "")).lower()
-        if "openai_image_fallback_failed" in combined:
-            raise RuntimeError("openai_image_fallback_failed")
-        if openai_fallback.codex_quota_exhausted(combined):
-            raise RuntimeError("codex_quota_unavailable")
-        raise RuntimeError("codex_scene_preparation_failed")
-    saved_candidates = [path for path in scene_run.saved_paths if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
-    candidates = saved_candidates or [path for path in scene_outputs if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
-    if len(candidates) != 1:
-        # Codex can emit more than one changed workspace artifact while still
-        # providing one authoritative imageGeneration.savedPath. If no saved
-        # path exists, fail closed rather than guessing between unrelated files.
-        raise RuntimeError("codex_scene_preparation_output_ambiguous")
-    try:
-        scene = Image.open(candidates[0]).convert("RGB")
-        artwork = Image.open(inputs[-1]).convert("RGB")
-    except Exception as exc:
-        raise RuntimeError("deterministic_composite_input_decode_failed") from exc
-    data, _ = _deterministic_composite(request, scene, artwork)
-    digest = hashlib.sha256(data).hexdigest()
-    return data, "image/png", digest, scene_outputs
 
 
 def _render(request: RenderRequest) -> tuple[bytes, str, str]:
@@ -1067,14 +876,6 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
                 command_inputs.append(reference)
             before = _snapshot(workspace)
             timeout = max(60, min(int(os.environ.get("CODEX_RENDER_TIMEOUT_SECONDS", "900")), 1800))
-            if request.mode in {"deterministic_frame", "deterministic_lifestyle"}:
-                data, mime, digest, scene_outputs = _render_deterministic(request, workspace, inputs, before)
-                outputs.extend(scene_outputs)
-                _record_fresh_proof(request.mode, request_hash, digest, "deterministic_scene_preparation;items=image_generation_call")
-                with _REQUEST_DIGESTS_LOCK:
-                    if request_hash in _REQUEST_DIGESTS:
-                        _REQUEST_DIGESTS[request_hash].update({"status": "succeeded", "output_sha256": digest, "composition_mode": "deterministic_raster_composite"})
-                return data, mime, digest
             prompt_context = ""
             if reference is not None:
                 prompt_context = "The final supplied image is DESIGN REFERENCE ONLY and is inspiration-only. Do not treat it as a listing asset, do not preserve its pixels, and do not copy it exactly."
@@ -1083,10 +884,6 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
             outputs.extend(path for path in result.saved_paths if path not in outputs)
             if result.returncode != 0:
                 combined = ((result.stderr or "") + "\n" + (result.stdout or "")).lower()
-                if "openai_image_fallback_failed" in combined:
-                    raise RuntimeError("openai_image_fallback_failed")
-                if openai_fallback.codex_quota_exhausted(combined):
-                    raise RuntimeError("codex_quota_unavailable")
                 if any(term in combined for term in ("not logged in", "unauthorized", "401")):
                     raise RuntimeError("codex_authentication_failed")
                 raise RuntimeError("codex_render_failed")
@@ -1346,8 +1143,7 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
         "mime": str(job.get("mime") or "image/png"),
         "output_sha256": str(job.get("output_sha256") or job.get("digest") or ""),
     })
-    if str(job.get("mode") or "") in {"deterministic_frame", "deterministic_lifestyle"}:
-        payload["composition_mode"] = "deterministic_raster_composite"
+    payload["composition_mode"] = "codex_generated_final_raster"
     return JSONResponse(payload, status_code=200)
 
 
@@ -1377,7 +1173,7 @@ async def render(request: RenderRequest, authorization: str | None = Header(defa
     return Response(content=data, media_type=mime, headers={
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Render-Mode": request.mode, "X-Image-Sha256": digest, "X-Render-Request-Sha256": _request_hash(request),
-        "X-Composition-Mode": "deterministic_raster_composite" if request.mode in {"deterministic_frame", "deterministic_lifestyle"} else "generative_final_raster",
+        "X-Composition-Mode": "codex_generated_final_raster",
     })
 
 
@@ -1450,5 +1246,5 @@ def render_async_result(job_id: str, authorization: str | None = Header(default=
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Image-Sha256": str(job.get("output_sha256") or job.get("digest") or ""),
         "X-Render-Request-Sha256": str(job.get("request_hash") or ""),
-        "X-Composition-Mode": "deterministic_raster_composite" if str(job.get("mode") or "") in {"deterministic_frame", "deterministic_lifestyle"} else "generative_final_raster",
+        "X-Composition-Mode": "codex_generated_final_raster",
     })

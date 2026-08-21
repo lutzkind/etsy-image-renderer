@@ -22,16 +22,6 @@ services:
       - CODEX_AUTH_SOURCE=/run/secrets/codex-session/auth.json
       - RENDER_DATA_DIR=/data
       - CODEX_RENDER_TIMEOUT_SECONDS
-      - OPENAI_API_KEY
-      - OPENAI_API_BASE_URL
-      - OPENAI_PROJECT
-      - OPENAI_ORGANIZATION
-      - OPENAI_IMAGE_FALLBACK_MODEL
-      - OPENAI_IMAGE_FALLBACK_IMAGE_MODEL
-      - OPENAI_IMAGE_FALLBACK_QUALITY
-      - OPENAI_IMAGE_FALLBACK_SIZE
-      - OPENAI_IMAGE_FALLBACK_TIMEOUT_SECONDS
-      - CODEX_QUOTA_CIRCUIT_SECONDS
     volumes:
       - renderer-data:/data
       - /root/.codex:/run/secrets/codex-session:ro
