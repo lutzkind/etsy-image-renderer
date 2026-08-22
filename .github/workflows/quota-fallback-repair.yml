@@ -1,51 +1,14 @@
-name: Quota fallback repair
+name: Quota fallback repair (retired)
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  repair:
+  retired:
+    if: ${{ false }}
     runs-on: [self-hosted, Linux, X64, ci, isolated]
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Disambiguate sync response header assertion
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('scripts/apply_quota_fallback_repair.py')
-          s = p.read_text(encoding='utf-8')
-          old = '''replace_once(\n    '        "X-Composition-Mode": "codex_generated_final_raster",\\n'\n    '    })\\n',\n    '        "X-Composition-Mode": "codex_generated_final_raster",\\n'\n    '        "X-Image-Provider": str(provider_meta.get("provider") or ""),\\n'\n    '        "X-Image-Fallback": "true" if provider_meta.get("fallback_used") else "false",\\n'\n    '        "X-Image-Fallback-Reason": str(provider_meta.get("fallback_reason") or ""),\\n'\n    '        "X-Image-Model": str(provider_meta.get("model") or ""),\\n'\n    '    })\\n',\n)\n'''
-          new = '''sync_headers_old = (\n    '        "X-Composition-Mode": "codex_generated_final_raster",\\n'\n    '    })\\n'\n)\nsync_headers_new = (\n    '        "X-Composition-Mode": "codex_generated_final_raster",\\n'\n    '        "X-Image-Provider": str(provider_meta.get("provider") or ""),\\n'\n    '        "X-Image-Fallback": "true" if provider_meta.get("fallback_used") else "false",\\n'\n    '        "X-Image-Fallback-Reason": str(provider_meta.get("fallback_reason") or ""),\\n'\n    '        "X-Image-Model": str(provider_meta.get("model") or ""),\\n'\n    '    })\\n'\n)\nif source.count(sync_headers_old) != 2:\n    raise SystemExit(f'expected exactly two composition response blocks, got {source.count(sync_headers_old)}')\nsource = source.replace(sync_headers_old, sync_headers_new, 1)\n'''
-          if s.count(old) != 1:
-              raise SystemExit(f'repair-script disambiguation invariant failed: {s.count(old)}')
-          p.write_text(s.replace(old, new, 1), encoding='utf-8')
-          PY
-      - name: Apply asserted repair
-        run: python scripts/apply_quota_fallback_repair.py
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-dev.txt
-      - name: Validate renderer
-        run: |
-          python -m py_compile app.py openai_fallback.py
-          pytest -q
-          git diff --check
-      - name: Commit tested repair
-        run: |
-          test -n "$(git status --porcelain)"
-          git config user.name 'ChatGPT Ops'
-          git config user.email 'bot@luxeillum.local'
-          git add app.py openai_fallback.py Dockerfile tests/test_app.py
-          git commit -m 'Wire quota-only API fallback into Etsy renderer'
-          git push origin HEAD:main
+      - run: echo "Retired workflow; no action performed."
