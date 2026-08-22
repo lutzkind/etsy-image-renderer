@@ -21,12 +21,13 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import openai_fallback
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 CONTRACT_VERSION = "luxlm-render-contract-v4-codex-final-raster"
 IMAGE_PIPELINE_VERSION = "1.8.0-codex-only-final-raster"
 FRESH_PROOF_SCHEMA_VERSION = "image-generation-proof-v2"
@@ -816,6 +817,9 @@ def readiness() -> dict[str, Any]:
         "image_generation": image_generation, "token_configured": bool(_token()),
         "renderer": "codex-local", "app_version": APP_VERSION, "contract_version": CONTRACT_VERSION,
         "customer_facing_generation": "codex_image_generation_only",
+        "image_provider_contract": "codex_primary_openai_api_quota_only_fallback",
+        "api_fallback_configured": openai_fallback.configured(),
+        "api_fallback_policy": "confirmed_codex_quota_only",
         "local_visual_compositing_allowed": False,
     }
 
@@ -841,7 +845,7 @@ def _release_failed_request(request_hash: str) -> None:
         _REQUEST_DIGESTS.pop(request_hash, None)
 
 
-def _render(request: RenderRequest) -> tuple[bytes, str, str]:
+def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
     urls = [_validate_public_https_url(url) for url in request.input_urls]
     template_url = _validate_public_https_url(request.template_reference_url) if request.template_reference_url else None
     request_hash = _request_hash(request)
@@ -879,13 +883,42 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
             prompt_context = ""
             if reference is not None:
                 prompt_context = "The final supplied image is DESIGN REFERENCE ONLY and is inspiration-only. Do not treat it as a listing asset, do not preserve its pixels, and do not copy it exactly."
-            result = _run_codex_app_server(workspace, command_inputs, _prompt(request, prompt_context), timeout)
+            render_prompt = _prompt(request, prompt_context)
+            result = _run_codex_app_server(workspace, command_inputs, render_prompt, timeout)
             outputs = _new_outputs(workspace, before, command_inputs)
             outputs.extend(path for path in result.saved_paths if path not in outputs)
             if result.returncode != 0:
                 combined = ((result.stderr or "") + "\n" + (result.stdout or "")).lower()
                 if any(term in combined for term in ("not logged in", "unauthorized", "401")):
                     raise RuntimeError("codex_authentication_failed")
+                if openai_fallback.codex_quota_exhausted(combined):
+                    openai_fallback.mark_codex_quota_exhausted()
+                    if not openai_fallback.configured():
+                        raise RuntimeError("codex_quota_exhausted_api_fallback_not_configured")
+                    try:
+                        fallback_data, fallback_mime, fallback_model = openai_fallback.generate_image(
+                            render_prompt, command_inputs, timeout
+                        )
+                    except openai_fallback.OpenAIImageFallbackError as exc:
+                        raise RuntimeError(f"openai_quota_fallback_failed:{str(exc)}") from exc
+                    if len(fallback_data) > MAX_OUTPUT_BYTES:
+                        raise RuntimeError("output_too_large")
+                    sniffed_mime, _ = _sniff_image(fallback_data)
+                    if sniffed_mime != fallback_mime:
+                        fallback_mime = sniffed_mime
+                    fallback_digest = hashlib.sha256(fallback_data).hexdigest()
+                    provider_meta = {
+                        "provider": "openai-api",
+                        "fallback_used": True,
+                        "fallback_reason": "quota",
+                        "model": fallback_model,
+                    }
+                    with _REQUEST_DIGESTS_LOCK:
+                        if request_hash in _REQUEST_DIGESTS:
+                            _REQUEST_DIGESTS[request_hash].update({
+                                "status": "succeeded", "output_sha256": fallback_digest, **provider_meta
+                            })
+                    return fallback_data, fallback_mime, fallback_digest, provider_meta
                 raise RuntimeError("codex_render_failed")
             event_summary = _codex_event_summary(result.stdout)
             unique: dict[str, tuple[bytes, str]] = {}
@@ -911,8 +944,15 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str]:
             _record_fresh_proof(request.mode, request_hash, digest, event_summary)
             with _REQUEST_DIGESTS_LOCK:
                 if request_hash in _REQUEST_DIGESTS:
-                    _REQUEST_DIGESTS[request_hash].update({"status": "succeeded", "output_sha256": digest})
-            return data, mime, digest
+                    _REQUEST_DIGESTS[request_hash].update({
+                        "status": "succeeded", "output_sha256": digest,
+                        "provider": "codex-image", "fallback_used": False,
+                        "fallback_reason": "", "model": "gpt-image-2",
+                    })
+            return data, mime, digest, {
+                "provider": "codex-image", "fallback_used": False,
+                "fallback_reason": "", "model": "gpt-image-2",
+            }
     except Exception:
         if not async_context:
             _release_failed_request(request_hash)
@@ -1093,7 +1133,7 @@ def _run_async_job(job_id: str, request: RenderRequest) -> None:
         _persist_async_job(job_id, job)
     _ASYNC_RENDER_CONTEXT.active = True
     try:
-        data, mime, digest = _render(request)
+        data, mime, digest, provider_meta = _render(request)
         with _ASYNC_JOBS_LOCK:
             if job_id in _ASYNC_JOBS:
                 result_path = _persist_async_result(job_id, data)
@@ -1103,6 +1143,10 @@ def _run_async_job(job_id: str, request: RenderRequest) -> None:
                     "digest": digest,
                     "output_sha256": digest,
                     "result_path": result_path,
+                    "provider": str(provider_meta.get("provider") or ""),
+                    "fallback_used": bool(provider_meta.get("fallback_used")),
+                    "fallback_reason": str(provider_meta.get("fallback_reason") or ""),
+                    "model": str(provider_meta.get("model") or ""),
                     "completed_at": time.time(),
                 })
                 _persist_async_job(job_id, _ASYNC_JOBS[job_id])
@@ -1142,6 +1186,10 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
         "result_url": f"/render-async/{job_id}/result",
         "mime": str(job.get("mime") or "image/png"),
         "output_sha256": str(job.get("output_sha256") or job.get("digest") or ""),
+        "provider": str(job.get("provider") or "codex-image"),
+        "fallback_used": bool(job.get("fallback_used")),
+        "fallback_reason": str(job.get("fallback_reason") or ""),
+        "model": str(job.get("model") or "gpt-image-2"),
     })
     payload["composition_mode"] = "codex_generated_final_raster"
     return JSONResponse(payload, status_code=200)
@@ -1163,7 +1211,7 @@ def health() -> dict[str, Any]:
 async def render(request: RenderRequest, authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> Response:
     _require_auth(authorization, x_renderer_token)
     try:
-        data, mime, digest = await asyncio.to_thread(_render, request)
+        data, mime, digest, provider_meta = await asyncio.to_thread(_render, request)
     except ValueError as exc:
         code = str(exc)
         raise HTTPException(status_code=409 if code == "duplicate_request_hash" else 400, detail=code) from exc
@@ -1174,6 +1222,10 @@ async def render(request: RenderRequest, authorization: str | None = Header(defa
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Render-Mode": request.mode, "X-Image-Sha256": digest, "X-Render-Request-Sha256": _request_hash(request),
         "X-Composition-Mode": "codex_generated_final_raster",
+        "X-Image-Provider": str(provider_meta.get("provider") or ""),
+        "X-Image-Fallback": "true" if provider_meta.get("fallback_used") else "false",
+        "X-Image-Fallback-Reason": str(provider_meta.get("fallback_reason") or ""),
+        "X-Image-Model": str(provider_meta.get("model") or ""),
     })
 
 
@@ -1247,4 +1299,8 @@ def render_async_result(job_id: str, authorization: str | None = Header(default=
         "X-Image-Sha256": str(job.get("output_sha256") or job.get("digest") or ""),
         "X-Render-Request-Sha256": str(job.get("request_hash") or ""),
         "X-Composition-Mode": "codex_generated_final_raster",
+        "X-Image-Provider": str(job.get("provider") or "codex-image"),
+        "X-Image-Fallback": "true" if job.get("fallback_used") else "false",
+        "X-Image-Fallback-Reason": str(job.get("fallback_reason") or ""),
+        "X-Image-Model": str(job.get("model") or "gpt-image-2"),
     })

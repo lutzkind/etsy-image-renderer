@@ -51,7 +51,7 @@ def card_payload(**overrides):
 
 
 def test_public_modes_are_codex_generation_only():
-    assert renderer.APP_VERSION == "1.13.0"
+    assert renderer.APP_VERSION == "1.14.0"
     assert set(renderer.ALLOWED_MODES) == {"minimal_frame", "lifestyle", "orientation", "decorative_asset", "designed_card"}
     assert "deterministic_frame" not in renderer.ALLOWED_MODES
     assert "deterministic_lifestyle" not in renderer.ALLOWED_MODES
@@ -143,8 +143,11 @@ def test_codex_event_summary_requires_image_generation_event():
 def test_readiness_is_not_satisfied_by_another_image_provider(monkeypatch):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
     monkeypatch.setattr(renderer.shutil, "which", lambda name: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "configured-api-fallback")
     status = renderer.readiness()
     assert status["ready"] is False
+    assert status["api_fallback_configured"] is True
+    assert status["api_fallback_policy"] == "confirmed_codex_quota_only"
     assert status["customer_facing_generation"] == "codex_image_generation_only"
     assert status["local_visual_compositing_allowed"] is False
 
@@ -187,6 +190,118 @@ def test_render_invokes_codex_for_minimal_frame_lifestyle_and_card(monkeypatch, 
         assert response.headers["x-composition-mode"] == "codex_generated_final_raster"
     assert [count for count, _ in calls] == [1, 2, 1]
 
+
+
+def test_confirmed_codex_quota_uses_reference_aware_api_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    captured = {}
+
+    def fake_download(url, target):
+        path = target.with_suffix(".png")
+        path.write_bytes(PNG + url.encode())
+        return path
+
+    def quota_run(workspace, inputs, prompt, timeout):
+        return renderer._CodexRun(1, "", "insufficient_quota: usage limit reached", ())
+
+    def fallback_generate(prompt, inputs, timeout):
+        captured["prompt"] = prompt
+        captured["inputs"] = [path.name for path in inputs]
+        return PNG + b"api", "image/png", "gpt-image-2"
+
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", quota_run)
+    monkeypatch.setattr(renderer.openai_fallback, "generate_image", fallback_generate)
+    monkeypatch.setattr(renderer.openai_fallback, "mark_codex_quota_exhausted", lambda: 1.0)
+    response = TestClient(renderer.app).post(
+        "/render", headers=AUTH,
+        json={"mode": "lifestyle", "input_urls": ["https://example.com/room.jpg", "https://example.com/art.jpg"]},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-image-provider"] == "openai-api"
+    assert response.headers["x-image-fallback"] == "true"
+    assert response.headers["x-image-fallback-reason"] == "quota"
+    assert len(captured["inputs"]) == 2
+    assert "complete editorial lifestyle raster" in captured["prompt"]
+
+
+@pytest.mark.parametrize("failure", [
+    "codex_app_server_timeout",
+    "network failure",
+    "429 rate limited",
+    "500 upstream capacity",
+    "malformed provider result",
+])
+def test_nonquota_codex_failures_never_use_api_fallback(monkeypatch, tmp_path, failure):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    calls = []
+
+    def fake_download(url, target):
+        path = target.with_suffix(".png")
+        path.write_bytes(PNG)
+        return path
+
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", lambda *args: renderer._CodexRun(1, "", failure, ()))
+    monkeypatch.setattr(renderer.openai_fallback, "generate_image", lambda *args: calls.append(args))
+    response = TestClient(renderer.app).post(
+        "/render", headers=AUTH,
+        json={"mode": "minimal_frame", "input_urls": ["https://example.com/art.jpg"]},
+    )
+    assert response.status_code == 503
+    assert calls == []
+
+
+def test_codex_auth_failure_never_uses_api_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    calls = []
+
+    def fake_download(url, target):
+        path = target.with_suffix(".png")
+        path.write_bytes(PNG)
+        return path
+
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", lambda *args: renderer._CodexRun(1, "", "401 unauthorized", ()))
+    monkeypatch.setattr(renderer.openai_fallback, "generate_image", lambda *args: calls.append(args))
+    response = TestClient(renderer.app).post(
+        "/render", headers=AUTH,
+        json={"mode": "minimal_frame", "input_urls": ["https://example.com/art.jpg"]},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "codex_authentication_failed"
+    assert calls == []
+
+
+def test_async_success_persists_provider_metadata(monkeypatch, tmp_path):
+    request = renderer.RenderRequest(mode="orientation", input_urls=["https://example.com/a.jpg"])
+    job_id = "provider-meta-job"
+    request_hash = renderer._request_hash(request)
+    renderer._ASYNC_JOBS[job_id] = {
+        "status": "queued", "created_at": 1.0, "request_hash": request_hash,
+        "request": request.model_dump(mode="json"),
+    }
+    renderer._ASYNC_HASH_INDEX[request_hash] = job_id
+    monkeypatch.setattr(renderer, "_render", lambda req: (
+        PNG, "image/png", "digest", {
+            "provider": "openai-api", "fallback_used": True,
+            "fallback_reason": "quota", "model": "gpt-image-2",
+        }
+    ))
+    renderer._run_async_job(job_id, request)
+    job = renderer._load_async_job(job_id)
+    assert job["provider"] == "openai-api"
+    assert job["fallback_used"] is True
+    assert job["fallback_reason"] == "quota"
 
 def test_completed_matching_async_requests_are_reused(monkeypatch):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
