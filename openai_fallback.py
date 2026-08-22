@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -57,20 +58,42 @@ def quota_circuit_seconds() -> int:
 
 
 def codex_quota_exhausted(raw: str) -> bool:
+    """Return True only for positive evidence that Codex usage is exhausted.
+
+    Generic 429/rate-limit, timeout, capacity, auth, or merely mentioning a
+    quota/plan/usage limit is intentionally insufficient. This predicate is the
+    spend boundary for the OpenAI API image fallback.
+    """
     value = str(raw or "").lower()
-    markers = (
-        "usage limit", "usage_limit", "insufficient_quota", "quota exhausted", "quota exceeded",
-        "plan limit", "weekly limit", "weighted tokens left", "you've hit your usage limit",
-        "you have hit your usage limit", "out of quota",
+    strong_markers = (
+        "insufficient_quota",
+        "quota exhausted",
+        "quota exceeded",
+        "out of quota",
+        "you've hit your usage limit",
+        "you have hit your usage limit",
+        "usage limit reached",
+        "reached your usage limit",
+        "weekly limit reached",
+        "reached your weekly limit",
+        "plan limit reached",
+        "plan limit exceeded",
     )
-    if any(marker in value for marker in markers):
+    if any(marker in value for marker in strong_markers):
         return True
-    if "x-codex-primary-used-percent" in value and "100" in value and (
-        "x-codex-credits-has-credits" in value and "false" in value
-        or "x-codex-credits-balance" in value and any(marker in value for marker in ("balance: 0", "balance=0", '"balance":0'))
-    ):
+
+    used_100 = bool(re.search(r"x-codex-primary-used-percent[^0-9]{0,12}100(?:\.0+)?\b", value))
+    no_credits = bool(re.search(r"x-codex-credits-has-credits[^a-z0-9]{0,12}false\b", value))
+    zero_balance = bool(re.search(r"x-codex-credits-balance[^0-9-]{0,12}0(?:\.0+)?\b", value))
+    if used_100 and (no_credits or zero_balance):
         return True
-    return "quota" in value and any(marker in value for marker in ("exhaust", "exceed", "limit", "remaining", "available"))
+
+    zero_remaining_patterns = (
+        r"quota\s+(?:remaining|left)[^0-9-]{0,12}0(?:\.0+)?\b",
+        r"(?:weighted\s+)?tokens\s+left[^0-9-]{0,12}0(?:\.0+)?\b",
+        r"quota\s+available[^a-z0-9-]{0,12}(?:false|0(?:\.0+)?)\b",
+    )
+    return any(re.search(pattern, value) for pattern in zero_remaining_patterns)
 
 
 def mark_codex_quota_exhausted(now: float | None = None) -> float:
