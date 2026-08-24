@@ -109,6 +109,35 @@ def test_lifestyle_accepts_scene_reference_and_artwork_as_inputs():
     assert renderer._role_contract(request)["output_kind"] == "final_asset"
 
 
+def test_lifestyle_position_three_contract_keeps_artwork_authoritative_and_scene_nonfinal():
+    request = renderer.RenderRequest(
+        mode="lifestyle",
+        module="framed_home_decor_mockup",
+        context="gallery position 3; premium neutral home decor",
+        input_urls=["https://example.com/room.jpg", "https://example.com/listing-artwork.png"],
+        asset_roles=[
+            {"role": "scene_reference", "url": "https://example.com/room.jpg", "preservation": "reference_only"},
+            {"role": "approved_listing_artwork", "url": "https://example.com/listing-artwork.png", "exact_pixel_preservation": True, "transform_allowed": False},
+        ],
+        generation_instructions={
+            "scene_reference_is_not_final": True,
+            "preserve_complete_source_subject": True,
+            "artwork_must_be_dominant": True,
+        },
+    )
+    prompt = renderer._prompt(request)
+    assert "supplied artwork as the listing-specific visual authority" in prompt
+    assert "do not serve the untouched room reference" in prompt
+    assert "approved_listing_artwork" in prompt
+
+
+def test_provider_output_equal_to_source_raster_is_rejected(tmp_path):
+    source = tmp_path / "source.png"
+    source.write_bytes(PNG)
+    with pytest.raises(RuntimeError, match="output_reused_input_raster"):
+        renderer._reject_reused_input_raster(PNG, renderer._input_raster_digests([source]))
+
+
 def test_codex_command_and_app_server_input_are_generation_paths(tmp_path):
     command = renderer._codex_app_server_command()
     assert command[:2] == ["codex", "app-server"]
