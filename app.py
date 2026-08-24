@@ -829,6 +829,18 @@ def _request_hash(request: RenderRequest) -> str:
     return hashlib.sha256(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _input_raster_digests(paths: list[Path]) -> set[str]:
+    """Return source-raster digests so a provider cannot silently reuse one as final art."""
+    return {hashlib.sha256(path.read_bytes()).hexdigest() for path in paths if path.is_file()}
+
+
+def _reject_reused_input_raster(data: bytes, input_digests: set[str]) -> str:
+    digest = hashlib.sha256(data).hexdigest()
+    if digest in input_digests:
+        raise RuntimeError("output_reused_input_raster")
+    return digest
+
+
 def _claim_request(request_hash: str) -> None:
     now = time.time()
     with _REQUEST_DIGESTS_LOCK:
@@ -878,6 +890,7 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
             command_inputs = list(inputs)
             if reference is not None:
                 command_inputs.append(reference)
+            input_digests = _input_raster_digests(command_inputs)
             before = _snapshot(workspace)
             timeout = max(60, min(int(os.environ.get("CODEX_RENDER_TIMEOUT_SECONDS", "900")), 1800))
             prompt_context = ""
@@ -906,7 +919,7 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
                     sniffed_mime, _ = _sniff_image(fallback_data)
                     if sniffed_mime != fallback_mime:
                         fallback_mime = sniffed_mime
-                    fallback_digest = hashlib.sha256(fallback_data).hexdigest()
+                    fallback_digest = _reject_reused_input_raster(fallback_data, input_digests)
                     provider_meta = {
                         "provider": "openai-api",
                         "fallback_used": True,
@@ -939,6 +952,7 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
             if len(unique) != 1:
                 raise RuntimeError("output_ambiguous")
             digest, (data, mime) = next(iter(unique.items()))
+            _reject_reused_input_raster(data, input_digests)
             if "image_generation_call" not in event_summary:
                 raise RuntimeError(f"image_generation_event_missing:stdout_events={event_summary}")
             _record_fresh_proof(request.mode, request_hash, digest, event_summary)
