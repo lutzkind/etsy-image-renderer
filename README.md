@@ -14,6 +14,8 @@ directory mount.
 The `personalization_examples` designed-card module accepts the frozen Etsy
 Make It Yours State A/B/C contract. Blank selectors preserve the purchased
 listing style; the renderer rejects artist-discretion/default-picker fields,
+and the obsolete single-dimension selector modules are disabled. The combined
+State A/B/C card is the only current personalization-card path.
 background-only contracts, and option definitions without their frozen visual
 references.
 

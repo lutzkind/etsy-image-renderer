@@ -276,6 +276,8 @@ class RenderRequest(BaseModel):
             self.input_urls = role_urls
             if not self.module.strip():
                 raise ValueError("designed_card_requires_module")
+            if self.module in {"font_palette", "background_palette"}:
+                raise ValueError("obsolete_single_dimension_selector_module_disabled")
             if not self.template_family.strip():
                 raise ValueError("designed_card_requires_template_family")
             headline = self.card_brief.get("headline") if isinstance(self.card_brief, dict) else None
