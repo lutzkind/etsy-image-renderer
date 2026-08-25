@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import selectors
 import shutil
 import socket
@@ -27,8 +28,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.14.0"
-CONTRACT_VERSION = "luxlm-render-contract-v4-codex-final-raster"
+APP_VERSION = "1.15.0"
+CONTRACT_VERSION = "luxlm-render-contract-v5-codex-final-raster-personalization-contract"
 IMAGE_PIPELINE_VERSION = "1.8.0-codex-only-final-raster"
 FRESH_PROOF_SCHEMA_VERSION = "image-generation-proof-v2"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
@@ -51,6 +52,9 @@ STRICT_NO_TEXT = [
     "paper_mat", "marketing_panel", "empty_label_region",
 ]
 DESIGNED_CARD_PROHIBITIONS = {"signature", "logo", "watermark", "competitor_branding", "price", "invented_claims"}
+PERSONALIZATION_CARD_MODULE = "personalization_examples"
+PERSONALIZATION_CARD_VERSION_PREFIX = "etsy-make-it-yours-card17-contract-"
+MAX_PERSONALIZATION_OPTIONS = 5
 
 _RENDER_LOCK = threading.BoundedSemaphore(1)
 _ASYNC_JOBS: dict[str, dict[str, Any]] = {}
@@ -65,6 +69,140 @@ _ASYNC_WORKER_LOCK = threading.Lock()
 _ASYNC_WORKER_STARTED = False
 _ASYNC_STATE_RESTORED = False
 app = FastAPI(title="Etsy Codex Renderer", version=APP_VERSION)
+
+
+def _validate_personalization_card_spec(spec: dict[str, Any]) -> None:
+    """Validate the immutable State A/B/C Make It Yours contract.
+
+    The renderer accepts the frozen contract as input, but it does not own
+    option selection or invent omission behavior.  In particular, the old
+    ``artist_discretion_when_omitted`` flag is deliberately rejected rather
+    than interpreted.
+    """
+    if not str(spec.get("version") or "").startswith(PERSONALIZATION_CARD_VERSION_PREFIX):
+        raise ValueError("personalization_card_contract_version_invalid")
+    state = str(spec.get("capability_state") or "").strip().upper()
+    if state not in {"A", "B", "C"}:
+        raise ValueError("personalization_card_capability_state_invalid")
+    if spec.get("no_artist_choice") is not True:
+        raise ValueError("personalization_card_no_artist_choice_required")
+    if any(key in spec for key in ("artist_discretion_when_omitted", "workflow_uses_default_when_omitted")):
+        raise ValueError("personalization_card_artist_discretion_field_forbidden")
+    if str(spec.get("omitted_font_behavior") or "") != "preserve_listing_style":
+        raise ValueError("personalization_card_omitted_font_behavior_invalid")
+    if str(spec.get("omitted_background_behavior") or "") != "preserve_listing_style":
+        raise ValueError("personalization_card_omitted_background_behavior_invalid")
+    if "preserve" not in str(spec.get("blank_guidance") or "").casefold():
+        raise ValueError("personalization_card_blank_guidance_invalid")
+    details = spec.get("artwork_details")
+    if not isinstance(details, dict) or not str(details.get("heading") or "").strip() or not str(details.get("instruction") or "").strip():
+        raise ValueError("personalization_card_artwork_details_required")
+    if not str(spec.get("personalization_contract_id") or "").strip() or not str(spec.get("personalization_contract_sha256") or "").strip():
+        raise ValueError("personalization_card_frozen_contract_binding_required")
+
+    fonts = spec.get("font_options")
+    backgrounds = spec.get("background_options")
+    if not isinstance(fonts, list) or not isinstance(backgrounds, list):
+        raise ValueError("personalization_card_option_lists_required")
+    if len(fonts) > MAX_PERSONALIZATION_OPTIONS or len(backgrounds) > MAX_PERSONALIZATION_OPTIONS:
+        raise ValueError("personalization_card_option_limit_exceeded")
+    if state == "A" and (fonts or backgrounds):
+        raise ValueError("personalization_card_state_a_has_unavailable_options")
+    if state == "B" and (not fonts or backgrounds):
+        raise ValueError("personalization_card_state_b_option_contract_invalid")
+    if state == "C" and (not fonts or not backgrounds):
+        raise ValueError("personalization_card_state_c_option_contract_invalid")
+    if not fonts and backgrounds:
+        raise ValueError("personalization_card_background_only_unsupported")
+
+    font_ids: list[str] = []
+    font_labels: list[str] = []
+    for option in fonts:
+        if not isinstance(option, dict):
+            raise ValueError("personalization_card_font_option_invalid")
+        option_id = str(option.get("id") or "").strip()
+        label = str(option.get("customer_label") or option.get("label") or "").strip()
+        if not option_id or not label:
+            raise ValueError("personalization_card_font_option_fields_required")
+        if not isinstance(option.get("generation_definition"), dict):
+            raise ValueError("personalization_card_font_generation_definition_required")
+        if not isinstance(option.get("canonical_visual_specimen_reference"), dict) or not str(option.get("specimen_sha256") or "").strip():
+            raise ValueError("personalization_card_font_visual_reference_required")
+        font_ids.append(option_id)
+        font_labels.append(label)
+    if len(font_ids) != len(set(font_ids)) or len(font_labels) != len(set(font_labels)):
+        raise ValueError("personalization_card_duplicate_font_option")
+
+    background_ids: list[str] = []
+    background_labels: list[str] = []
+    for option in backgrounds:
+        if not isinstance(option, dict):
+            raise ValueError("personalization_card_background_option_invalid")
+        option_id = str(option.get("id") or "").strip()
+        label = str(option.get("customer_label") or option.get("label") or "").strip()
+        colour = str(option.get("srgb_hex") or "").strip().upper()
+        if not option_id or not label or not re.fullmatch(r"#[0-9A-F]{6}", colour):
+            raise ValueError("personalization_card_background_option_fields_invalid")
+        if not isinstance(option.get("generation_definition"), dict):
+            raise ValueError("personalization_card_background_generation_definition_required")
+        if not isinstance(option.get("canonical_visual_swatch_reference"), dict) or not str(option.get("swatch_sha256") or "").strip():
+            raise ValueError("personalization_card_background_visual_reference_required")
+        background_ids.append(option_id)
+        background_labels.append(label)
+    if len(background_ids) != len(set(background_ids)) or len(background_labels) != len(set(background_labels)):
+        raise ValueError("personalization_card_duplicate_background_option")
+
+
+def _validate_legacy_selector_spec(spec: dict[str, Any], module: str) -> None:
+    """Validate the remaining single-dimension selector transport.
+
+    This compatibility path is still contract-bound, but it has no artist
+    discretion field and cannot be used for the State A/B/C card.
+    """
+    if module not in {"font_palette", "background_palette"}:
+        raise ValueError("designed_card_selector_module_invalid")
+    if any(key in spec for key in ("artist_discretion_when_omitted", "workflow_uses_default_when_omitted")):
+        raise ValueError("designed_card_selector_artist_discretion_field_forbidden")
+    dimension = str(spec.get("selector_dimension") or "").strip().lower()
+    expected_dimension = "lettering" if module == "font_palette" else "background"
+    if dimension != expected_dimension:
+        raise ValueError(f"designed_card_{module}_selector_dimension_invalid")
+    if not bool(spec.get("selection_optional")):
+        raise ValueError("designed_card_selector_requires_optional_selection")
+    if str(spec.get("omitted_option_behavior") or "") != "preserve_listing_style":
+        raise ValueError("designed_card_selector_omitted_behavior_invalid")
+    if bool(spec.get("workflow_uses_default_when_omitted")):
+        raise ValueError("designed_card_selector_default_forbidden")
+    if str(spec.get("default_font_option_id") or "").strip() or str(spec.get("default_background_option_id") or "").strip():
+        raise ValueError("designed_card_selector_default_id_forbidden")
+    if spec.get("semantic_treatments_only") is not True:
+        raise ValueError("designed_card_selector_requires_semantic_treatments")
+    if not str(spec.get("default_note") or "").strip() or not str(spec.get("truthfulness_note") or "").strip():
+        raise ValueError("designed_card_selector_notes_required")
+    active_key = "lettering_options" if dimension == "lettering" else "background_options"
+    inactive_key = "background_options" if dimension == "lettering" else "lettering_options"
+    options = spec.get(active_key)
+    if not isinstance(options, list) or not 1 <= len(options) <= MAX_PERSONALIZATION_OPTIONS or spec.get(inactive_key) not in (None, []):
+        raise ValueError("designed_card_selector_options_invalid")
+    ids: list[str] = []
+    labels: list[str] = []
+    for option in options:
+        if not isinstance(option, dict):
+            raise ValueError("designed_card_selector_option_invalid")
+        option_id = str(option.get("id") or "").strip()
+        label = str(option.get("label") or option.get("customer_label") or "").strip()
+        if not option_id or not label:
+            raise ValueError("designed_card_selector_option_fields_required")
+        ids.append(option_id)
+        labels.append(label)
+        if dimension == "lettering" and option.get("is_handwritten") is not True:
+            raise ValueError("designed_card_selector_font_not_handwritten")
+        if dimension == "background" and not str(option.get("colour_name") or label).strip():
+            raise ValueError("designed_card_selector_colour_name_missing")
+    if len(ids) != len(set(ids)) or len(labels) != len(set(labels)):
+        raise ValueError("designed_card_selector_duplicate_option")
+    if dimension == "lettering" and not str(spec.get("sample_text") or "").strip():
+        raise ValueError("designed_card_selector_sample_missing")
 
 
 class AssetRole(BaseModel):
@@ -146,56 +284,15 @@ class RenderRequest(BaseModel):
             if not DESIGNED_CARD_PROHIBITIONS.issubset(set(self.prohibited_elements)):
                 raise ValueError("designed_card_requires_prohibitions")
             selector_spec = self.card_brief.get("selector_spec") if isinstance(self.card_brief, dict) else None
-            if self.module in {"font_palette", "background_palette"} and not selector_spec:
+            if self.module in {"font_palette", "background_palette", PERSONALIZATION_CARD_MODULE} and not selector_spec:
                 raise ValueError("designed_card_selector_spec_required")
             if selector_spec not in (None, {}):
                 if not isinstance(selector_spec, dict):
                     raise ValueError("designed_card_invalid_selector_spec")
-                dimension = str(selector_spec.get("selector_dimension") or "").strip().lower()
-                if self.module == "font_palette" and dimension != "lettering":
-                    raise ValueError("designed_card_font_selector_dimension_invalid")
-                if self.module == "background_palette" and dimension != "background":
-                    raise ValueError("designed_card_background_selector_dimension_invalid")
-                if self.module not in {"font_palette", "background_palette"}:
-                    raise ValueError("designed_card_selector_module_invalid")
-                if dimension not in {"lettering", "background"}:
-                    raise ValueError("designed_card_selector_dimension_invalid")
-                if not bool(selector_spec.get("selection_optional")):
-                    raise ValueError("designed_card_selector_requires_optional_selection")
-                if not bool(selector_spec.get("artist_discretion_when_omitted")):
-                    raise ValueError("designed_card_selector_requires_artist_discretion")
-                if bool(selector_spec.get("workflow_uses_default_when_omitted")):
-                    raise ValueError("designed_card_selector_default_forbidden")
-                if str(selector_spec.get("default_font_option_id") or "").strip() or str(selector_spec.get("default_background_option_id") or "").strip():
-                    raise ValueError("designed_card_selector_default_id_forbidden")
-                if selector_spec.get("semantic_treatments_only") is not True:
-                    raise ValueError("designed_card_selector_requires_semantic_treatments")
-                if not str(selector_spec.get("default_note") or "").strip() or not str(selector_spec.get("truthfulness_note") or "").strip():
-                    raise ValueError("designed_card_selector_notes_required")
-                active_key = "lettering_options" if dimension == "lettering" else "background_options"
-                inactive_key = "background_options" if dimension == "lettering" else "lettering_options"
-                options = selector_spec.get(active_key)
-                if not isinstance(options, list) or not 1 <= len(options) <= 5 or selector_spec.get(inactive_key) not in (None, []):
-                    raise ValueError("designed_card_selector_options_invalid")
-                ids: list[str] = []
-                labels: list[str] = []
-                for option in options:
-                    if not isinstance(option, dict):
-                        raise ValueError("designed_card_selector_option_invalid")
-                    option_id = str(option.get("id") or "").strip()
-                    label = str(option.get("label") or "").strip()
-                    if not option_id or not label:
-                        raise ValueError("designed_card_selector_option_fields_required")
-                    ids.append(option_id)
-                    labels.append(label)
-                    if dimension == "lettering" and option.get("is_handwritten") is not True:
-                        raise ValueError("designed_card_selector_font_not_handwritten")
-                    if dimension == "background" and not str(option.get("colour_name") or label).strip():
-                        raise ValueError("designed_card_selector_colour_name_missing")
-                if len(ids) != len(set(ids)) or len(labels) != len(set(labels)):
-                    raise ValueError("designed_card_selector_duplicate_option")
-                if dimension == "lettering" and not str(selector_spec.get("sample_text") or "").strip():
-                    raise ValueError("designed_card_selector_sample_missing")
+                if self.module == PERSONALIZATION_CARD_MODULE:
+                    _validate_personalization_card_spec(selector_spec)
+                else:
+                    _validate_legacy_selector_spec(selector_spec, self.module)
         else:
             if self.asset_roles:
                 role_urls = [role.url.strip() for role in self.asset_roles]
@@ -356,31 +453,49 @@ def _prompt(request: RenderRequest | str, context: str = "") -> str:
         instruction = "Create one cohesive, premium editorial Etsy gallery card for the supplied listing and module."
         selector_spec = request.card_brief.get("selector_spec") if isinstance(request.card_brief, dict) else None
         if isinstance(selector_spec, dict):
-            dimension = str(selector_spec.get("selector_dimension") or "").strip().lower()
-            options_key = "lettering_options" if dimension == "lettering" else "background_options"
-            options = [dict(item or {}) for item in (selector_spec.get(options_key) or [])]
-            labels = [str(item.get("label") or "").strip() for item in options]
-            common += (
-                " This is a buyer-facing personalization selector generated by Codex Image 2, not a software configuration panel. "
-                f"It is a dedicated {dimension} card. The title and every option label in selector_spec are approved visible copy: "
-                f"render each approved option label exactly once, with no invented option names and no omitted options. "
-                f"Approved option labels are {json.dumps(labels, ensure_ascii=False)}. "
-                "The selector must show real visual comparisons in the supplied listing artwork context and remain a premium editorial Etsy gallery card. "
-                "The optional note must make clear that leaving the choice blank means the artist chooses what suits the individual artwork best. "
-                "Do not claim exact font-file fidelity, exact glyph metrics, or exact RGB/hex colour formulas."
-            )
-            if dimension == "lettering":
+            full_personalization = str(selector_spec.get("version") or "").startswith(PERSONALIZATION_CARD_VERSION_PREFIX)
+            if full_personalization:
+                state = str(selector_spec.get("capability_state") or "").strip().upper()
+                fonts = [dict(item or {}) for item in (selector_spec.get("font_options") or [])]
+                backgrounds = [dict(item or {}) for item in (selector_spec.get("background_options") or [])]
+                font_labels = [str(item.get("customer_label") or item.get("label") or "").strip() for item in fonts]
+                background_labels = [str(item.get("customer_label") or item.get("label") or "").strip() for item in backgrounds]
+                labels = font_labels + background_labels
+                common += (
+                    " This is the buyer-facing Make It Yours personalization card generated by Codex Image 2, not a software configuration panel. "
+                    f"It is frozen personalization State {state}. Render the Artwork details guidance and every approved option label exactly once, "
+                    f"with no invented option names and no omitted options. Approved option labels are {json.dumps(labels, ensure_ascii=False)}. "
+                    "For State A show the Artwork details instructions and no selector. For State B show every distinct handwritten lettering specimen and no background selector. "
+                    "For State C show every distinct handwritten lettering specimen and every exact named colour swatch. "
+                    "The blank guidance must say that leaving a selector blank preserves the style shown in this listing. "
+                    "Use the frozen visual references and generation definitions as the option authority. Do not claim deterministic font-file fidelity or replace exact swatches with vague colour names."
+                )
+                instruction = "Create one cohesive, premium editorial Etsy Make It Yours card with the supplied artwork as the visual authority."
+            else:
+                dimension = str(selector_spec.get("selector_dimension") or "").strip().lower()
+                options_key = "lettering_options" if dimension == "lettering" else "background_options"
+                options = [dict(item or {}) for item in (selector_spec.get(options_key) or [])]
+                labels = [str(item.get("label") or item.get("customer_label") or "").strip() for item in options]
+                common += (
+                    " This is a buyer-facing personalization selector generated by Codex Image 2, not a software configuration panel. "
+                    f"It is a dedicated {dimension} card. The title and every option label in selector_spec are approved visible copy: "
+                    f"render each approved option label exactly once, with no invented option names and no omitted options. "
+                    f"Approved option labels are {json.dumps(labels, ensure_ascii=False)}. "
+                    "The selector must show real visual comparisons in the supplied listing artwork context and remain a premium editorial Etsy gallery card. "
+                    "The note must make clear that leaving the choice blank preserves the style shown in the listing. "
+                    "Do not claim exact font-file fidelity, exact glyph metrics, or exact RGB/hex colour formulas."
+                )
+            if not full_personalization and dimension == "lettering":
                 common += (
                     f" Use the single consistent sample phrase {json.dumps(str(selector_spec.get('sample_text') or '').strip(), ensure_ascii=False)}. "
                     "All displayed treatments must look handwritten, signature-like, script-like, or calligraphic; never use generic serif or sans lettering. "
                     "Make every handwritten treatment visibly and meaningfully different at Etsy mobile thumbnail size."
                 )
-            else:
+            elif not full_personalization:
                 common += (
                     "Show each named colour as a visibly distinct treatment of the actual artwork or art fragment in context; tiny abstract swatches alone are insufficient. "
                     "Use clear buyer-facing colour names, not vague mood categories."
                 )
-            instruction = "Create one cohesive, premium editorial Etsy personalization selector card with the supplied artwork as the visual authority."
     else:
         common = (
             "$imagegen\nBefore writing any textual response, invoke the built-in image_gen/image_generation tool exactly once and wait for its raster result. "
