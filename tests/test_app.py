@@ -51,7 +51,7 @@ def card_payload(**overrides):
 
 
 def test_public_modes_are_codex_generation_only():
-    assert renderer.APP_VERSION == "1.14.0"
+    assert renderer.APP_VERSION == "1.15.0"
     assert set(renderer.ALLOWED_MODES) == {"minimal_frame", "lifestyle", "orientation", "decorative_asset", "designed_card"}
     assert "deterministic_frame" not in renderer.ALLOWED_MODES
     assert "deterministic_lifestyle" not in renderer.ALLOWED_MODES
@@ -93,6 +93,83 @@ def test_designed_card_is_complete_codex_output_with_exact_copy():
     assert "Photo Guide" in prompt
     assert "Use exactly the approved card_brief headline, body, and bullets" in prompt
     assert request.mode == "designed_card"
+
+
+def _personalization_spec(state: str) -> dict:
+    font = {
+        "id": "elegant_script",
+        "customer_label": "Elegant Script",
+        "specimen_text": "Your Name",
+        "generation_definition": {"renderer": "codex_final_visual", "treatment_family": "script"},
+        "canonical_visual_specimen_reference": {"kind": "codex_handwriting_specimen", "option_id": "elegant_script"},
+        "specimen_sha256": "a" * 64,
+    }
+    background = {
+        "id": "sage_green",
+        "customer_label": "Sage Green",
+        "srgb_hex": "#A8B8A3",
+        "generation_definition": {"renderer": "codex_final_visual", "srgb_hex": "#A8B8A3"},
+        "canonical_visual_swatch_reference": {"kind": "exact_srgb_swatch", "option_id": "sage_green"},
+        "swatch_sha256": "b" * 64,
+    }
+    return {
+        "version": "etsy-make-it-yours-card17-contract-v1-codex-visual",
+        "personalization_contract_id": "pc-test",
+        "personalization_contract_sha256": "c" * 64,
+        "capability_state": state,
+        "artwork_details": {"heading": "Artwork details", "instruction": "Add optional supported instructions."},
+        "font_options": [font] if state in {"B", "C"} else [],
+        "background_options": [background] if state == "C" else [],
+        "omitted_font_behavior": "preserve_listing_style",
+        "omitted_background_behavior": "preserve_listing_style",
+        "blank_guidance": "Leave a selector blank to preserve the style shown in this listing.",
+        "no_artist_choice": True,
+    }
+
+
+def _designed_card_request(selector_spec: dict, module: str = "personalization_examples") -> dict:
+    return {
+        "mode": "designed_card",
+        "input_urls": ["https://example.com/artwork.jpg"],
+        "expected_input_count": 1,
+        "asset_roles": [{"role": "approved_listing_artwork", "url": "https://example.com/artwork.jpg"}],
+        "listing_assets": [{"role": "approved_listing_artwork"}],
+        "module": module,
+        "template_family": "listing_specific_codex_designed_card",
+        "card_brief": {"headline": "Make It Yours", "selector_spec": selector_spec},
+        "prohibited_elements": sorted(renderer.DESIGNED_CARD_PROHIBITIONS),
+    }
+
+
+def test_make_it_yours_states_use_frozen_contract_without_artist_discretion():
+    for state in ("A", "B", "C"):
+        request = renderer.RenderRequest.model_validate(_designed_card_request(_personalization_spec(state)))
+        assert request.module == "personalization_examples"
+
+
+def test_make_it_yours_rejects_artist_discretion_field():
+    spec = _personalization_spec("B")
+    spec["artist_discretion_when_omitted"] = True
+    with pytest.raises(ValueError, match="artist_discretion_field_forbidden"):
+        renderer.RenderRequest.model_validate(_designed_card_request(spec))
+
+
+def test_single_dimension_selector_requires_preserve_behavior():
+    spec = {
+        "selector_dimension": "lettering",
+        "selection_optional": True,
+        "omitted_option_behavior": "preserve_listing_style",
+        "default_font_option_id": "",
+        "default_background_option_id": "",
+        "default_note": "Leave blank to preserve the listing style.",
+        "truthfulness_note": "Semantic treatment preview.",
+        "semantic_treatments_only": True,
+        "sample_text": "Your Name",
+        "lettering_options": [{"id": "elegant_script", "label": "Elegant Script", "is_handwritten": True}],
+        "background_options": [],
+    }
+    request = renderer.RenderRequest.model_validate(_designed_card_request(spec, "font_palette"))
+    assert request.module == "font_palette"
 
 
 def test_lifestyle_accepts_scene_reference_and_artwork_as_inputs():
