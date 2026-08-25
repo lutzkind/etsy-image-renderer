@@ -154,7 +154,7 @@ def test_make_it_yours_rejects_artist_discretion_field():
         renderer.RenderRequest.model_validate(_designed_card_request(spec))
 
 
-def test_single_dimension_selector_requires_preserve_behavior():
+def test_single_dimension_selector_module_is_disabled():
     spec = {
         "selector_dimension": "lettering",
         "selection_optional": True,
@@ -168,8 +168,8 @@ def test_single_dimension_selector_requires_preserve_behavior():
         "lettering_options": [{"id": "elegant_script", "label": "Elegant Script", "is_handwritten": True}],
         "background_options": [],
     }
-    request = renderer.RenderRequest.model_validate(_designed_card_request(spec, "font_palette"))
-    assert request.module == "font_palette"
+    with pytest.raises(ValueError, match="obsolete_single_dimension_selector_module_disabled"):
+        renderer.RenderRequest.model_validate(_designed_card_request(spec, "font_palette"))
 
 
 def test_lifestyle_accepts_scene_reference_and_artwork_as_inputs():
