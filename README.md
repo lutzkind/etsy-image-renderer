@@ -9,7 +9,13 @@ single file. This preserves visibility of an atomic refresh-token replacement
 across restarts and prevents a missing source file from becoming a Docker
 directory mount.
 
-`POST /render` and `POST /render-async` accept the versioned `luxlm-render-contract-v4-codex-only-final-raster`.
+`POST /render` and `POST /render-async` accept the versioned `luxlm-render-contract-v5-codex-final-raster-personalization-contract`.
+
+The `personalization_examples` designed-card module accepts the frozen Etsy
+Make It Yours State A/B/C contract. Blank selectors preserve the purchased
+listing style; the renderer rejects artist-discretion/default-picker fields,
+background-only contracts, and option definitions without their frozen visual
+references.
 
 ## Modes
 
