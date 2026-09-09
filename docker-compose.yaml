@@ -24,7 +24,9 @@ services:
       - CODEX_RENDER_TIMEOUT_SECONDS
     volumes:
       - renderer-data:/data
-      - /root/.codex:/run/secrets/codex-session:ro
+      # The entrypoint keeps the runtime copy current and propagates Codex's
+      # atomic token refresh back to this canonical shared auth directory.
+      - /root/.codex:/run/secrets/codex-session:rw
     expose:
       - "8080"
     networks:

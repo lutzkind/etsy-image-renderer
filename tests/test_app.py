@@ -264,6 +264,18 @@ def test_render_endpoint_requires_auth(monkeypatch):
     assert response.status_code == 401
 
 
+def test_runtime_entrypoint_tracks_atomic_shared_auth_refresh():
+    root = Path(__file__).resolve().parents[1]
+    entrypoint = (root / "runtime-entrypoint.sh").read_text(encoding="utf-8")
+    compose = (root / "docker-compose.yaml").read_text(encoding="utf-8")
+
+    assert "sync_auth_from_source" in entrypoint
+    assert "sync_auth_to_source" in entrypoint
+    assert "auth_sync_loop" in entrypoint
+    assert 'mv -f "$sync_path" "$auth_source"' in entrypoint
+    assert "/root/.codex:/run/secrets/codex-session:rw" in compose
+
+
 def test_render_invokes_codex_for_minimal_frame_lifestyle_and_card(monkeypatch, tmp_path):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
     monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
