@@ -905,7 +905,6 @@ def _run_codex_app_server(workspace: Path, inputs: list[Path], prompt: str, time
         "\n".join(stderr_chunks),
         _safe_saved_paths("\n".join(stdout_lines), workspace, inputs),
     )
-    failure_text = (result.stderr or "") + "\n" + (result.stdout or "")
     return result
 
 
@@ -956,6 +955,41 @@ def _reject_reused_input_raster(data: bytes, input_digests: set[str]) -> str:
     if digest in input_digests:
         raise RuntimeError("output_reused_input_raster")
     return digest
+
+
+def _openai_quota_fallback(
+    prompt: str,
+    inputs: list[Path],
+    timeout: int,
+    input_digests: set[str],
+    request_hash: str,
+) -> tuple[bytes, str, str, dict[str, Any]]:
+    if not openai_fallback.configured():
+        raise RuntimeError("codex_quota_exhausted_api_fallback_not_configured")
+    try:
+        fallback_data, fallback_mime, fallback_model = openai_fallback.generate_image(
+            prompt, inputs, timeout
+        )
+    except openai_fallback.OpenAIImageFallbackError as exc:
+        raise RuntimeError(f"openai_quota_fallback_failed:{str(exc)}") from exc
+    if len(fallback_data) > MAX_OUTPUT_BYTES:
+        raise RuntimeError("output_too_large")
+    sniffed_mime, _ = _sniff_image(fallback_data)
+    if sniffed_mime != fallback_mime:
+        fallback_mime = sniffed_mime
+    fallback_digest = _reject_reused_input_raster(fallback_data, input_digests)
+    provider_meta = {
+        "provider": "openai-api",
+        "fallback_used": True,
+        "fallback_reason": "quota",
+        "model": fallback_model,
+    }
+    with _REQUEST_DIGESTS_LOCK:
+        if request_hash in _REQUEST_DIGESTS:
+            _REQUEST_DIGESTS[request_hash].update({
+                "status": "succeeded", "output_sha256": fallback_digest, **provider_meta
+            })
+    return fallback_data, fallback_mime, fallback_digest, provider_meta
 
 
 def _claim_request(request_hash: str) -> None:
@@ -1014,6 +1048,10 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
             if reference is not None:
                 prompt_context = "The final supplied image is DESIGN REFERENCE ONLY and is inspiration-only. Do not treat it as a listing asset, do not preserve its pixels, and do not copy it exactly."
             render_prompt = _prompt(request, prompt_context)
+            if openai_fallback.quota_circuit_open() and openai_fallback.configured():
+                return _openai_quota_fallback(
+                    render_prompt, command_inputs, timeout, input_digests, request_hash
+                )
             result = _run_codex_app_server(workspace, command_inputs, render_prompt, timeout)
             outputs = _new_outputs(workspace, before, command_inputs)
             outputs.extend(path for path in result.saved_paths if path not in outputs)
@@ -1023,32 +1061,9 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
                     raise RuntimeError("codex_authentication_failed")
                 if openai_fallback.codex_quota_exhausted(combined):
                     openai_fallback.mark_codex_quota_exhausted()
-                    if not openai_fallback.configured():
-                        raise RuntimeError("codex_quota_exhausted_api_fallback_not_configured")
-                    try:
-                        fallback_data, fallback_mime, fallback_model = openai_fallback.generate_image(
-                            render_prompt, command_inputs, timeout
-                        )
-                    except openai_fallback.OpenAIImageFallbackError as exc:
-                        raise RuntimeError(f"openai_quota_fallback_failed:{str(exc)}") from exc
-                    if len(fallback_data) > MAX_OUTPUT_BYTES:
-                        raise RuntimeError("output_too_large")
-                    sniffed_mime, _ = _sniff_image(fallback_data)
-                    if sniffed_mime != fallback_mime:
-                        fallback_mime = sniffed_mime
-                    fallback_digest = _reject_reused_input_raster(fallback_data, input_digests)
-                    provider_meta = {
-                        "provider": "openai-api",
-                        "fallback_used": True,
-                        "fallback_reason": "quota",
-                        "model": fallback_model,
-                    }
-                    with _REQUEST_DIGESTS_LOCK:
-                        if request_hash in _REQUEST_DIGESTS:
-                            _REQUEST_DIGESTS[request_hash].update({
-                                "status": "succeeded", "output_sha256": fallback_digest, **provider_meta
-                            })
-                    return fallback_data, fallback_mime, fallback_digest, provider_meta
+                    return _openai_quota_fallback(
+                        render_prompt, command_inputs, timeout, input_digests, request_hash
+                    )
                 raise RuntimeError("codex_render_failed")
             event_summary = _codex_event_summary(result.stdout)
             unique: dict[str, tuple[bytes, str]] = {}

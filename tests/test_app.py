@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import socket
-import subprocess
 import sys
 from pathlib import Path
 
@@ -26,12 +24,14 @@ def clear_state(tmp_path, monkeypatch):
     renderer._ASYNC_HASH_INDEX.clear()
     renderer._ASYNC_QUEUE_IDS.clear()
     renderer._ASYNC_STATE_RESTORED = False
+    renderer.openai_fallback.reset_quota_circuit()
     yield
     renderer._REQUEST_DIGESTS.clear()
     renderer._ASYNC_JOBS.clear()
     renderer._ASYNC_HASH_INDEX.clear()
     renderer._ASYNC_QUEUE_IDS.clear()
     renderer._ASYNC_STATE_RESTORED = False
+    renderer.openai_fallback.reset_quota_circuit()
 
 
 def card_payload(**overrides):
@@ -344,6 +344,37 @@ def test_confirmed_codex_quota_uses_reference_aware_api_fallback(monkeypatch, tm
     assert response.headers["x-image-fallback-reason"] == "quota"
     assert len(captured["inputs"]) == 2
     assert "complete editorial lifestyle raster" in captured["prompt"]
+
+
+def test_openai_quota_circuit_skips_repeated_codex_calls(monkeypatch, tmp_path):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    codex_calls = []
+    fallback_calls = []
+
+    def fake_download(url, target):
+        path = target.with_suffix(".png")
+        path.write_bytes(PNG + url.encode())
+        return path
+
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", lambda *args: codex_calls.append(args) or renderer._CodexRun(1, "", "usage limit reached", ()))
+    monkeypatch.setattr(renderer.openai_fallback, "generate_image", lambda *args: fallback_calls.append(args) or (PNG + b"api", "image/png", "gpt-image-2"))
+
+    first = TestClient(renderer.app).post(
+        "/render", headers=AUTH,
+        json={"mode": "minimal_frame", "input_urls": ["https://example.com/art-a.jpg"]},
+    )
+    second = TestClient(renderer.app).post(
+        "/render", headers=AUTH,
+        json={"mode": "minimal_frame", "input_urls": ["https://example.com/art-b.jpg"]},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(codex_calls) == 1
+    assert len(fallback_calls) == 2
 
 
 @pytest.mark.parametrize("failure", [
