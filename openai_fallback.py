@@ -155,6 +155,26 @@ def _tool_config(has_inputs: bool) -> dict[str, Any]:
     return tool
 
 
+def _provider_error_detail(response: httpx.Response) -> str:
+    """Return bounded non-secret provider detail for a failed API request."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        parts = [
+            str(error.get("type") or "").strip(),
+            str(error.get("code") or "").strip(),
+            " ".join(str(error.get("message") or "").split()),
+        ]
+        detail = ":".join(part for part in parts if part)
+    else:
+        detail = " ".join(str(response.text or "").split())
+    detail = detail.replace("\n", " ").strip()
+    return detail[:240]
+
+
 def generate_image(prompt: str, inputs: list[Path], request_timeout: int | None = None) -> tuple[bytes, str, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -165,7 +185,10 @@ def generate_image(prompt: str, inputs: list[Path], request_timeout: int | None 
         "model": responses_model(),
         "input": [{"role": "user", "content": content}],
         "tools": [_tool_config(bool(inputs))],
-        "tool_choice": {"type": "image_generation"},
+        # Responses API hosted tools use the string form for a required call.
+        # The object form is reserved for function/MCP/custom tool choices and
+        # produces HTTP 400 for image_generation.
+        "tool_choice": "required",
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     project = os.environ.get("OPENAI_PROJECT", "").strip()
@@ -180,7 +203,9 @@ def generate_image(prompt: str, inputs: list[Path], request_timeout: int | None 
     except httpx.HTTPError as exc:
         raise OpenAIImageFallbackError("openai_image_fallback_transport_failed") from exc
     if response.status_code >= 400:
-        raise OpenAIImageFallbackError(f"openai_image_fallback_http_{response.status_code}")
+        detail = _provider_error_detail(response)
+        suffix = f":{detail}" if detail else ""
+        raise OpenAIImageFallbackError(f"openai_image_fallback_http_{response.status_code}{suffix}")
     try:
         body = response.json()
     except ValueError as exc:

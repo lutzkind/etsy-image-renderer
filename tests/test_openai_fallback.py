@@ -1,3 +1,6 @@
+import base64
+from pathlib import Path
+
 import pytest
 
 import openai_fallback
@@ -50,3 +53,71 @@ def test_codex_quota_exhausted_requires_positive_exhaustion_evidence(raw):
 )
 def test_codex_quota_exhausted_rejects_nonexhausted_and_nonquota_failures(raw):
     assert openai_fallback.codex_quota_exhausted(raw) is False
+
+
+def test_responses_fallback_forces_the_only_hosted_image_tool(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "output": [{
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(b"\x89PNG\r\n\x1a\nresult").decode("ascii"),
+                }],
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, *, headers, json):
+            captured.update({"url": url, "headers": headers, "payload": json})
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setattr(openai_fallback.httpx, "Client", FakeClient)
+    input_path = Path(tmp_path) / "art.png"
+    input_path.write_bytes(b"\x89PNG\r\n\x1a\ninput")
+
+    data, mime, model = openai_fallback.generate_image("make a frame", [input_path], 120)
+
+    assert data.startswith(b"\x89PNG")
+    assert mime == "image/png"
+    assert model == "gpt-image-2"
+    assert captured["payload"]["tool_choice"] == "required"
+    assert captured["payload"]["tools"][0]["type"] == "image_generation"
+    assert captured["payload"]["tools"][0]["action"] == "edit"
+
+
+def test_responses_fallback_preserves_bounded_provider_error_detail(monkeypatch):
+    class FakeResponse:
+        status_code = 400
+        text = ""
+
+        def json(self):
+            return {"error": {"type": "invalid_request_error", "code": "invalid_value", "message": "bad tool choice"}}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setattr(openai_fallback.httpx, "Client", lambda **kwargs: FakeClient())
+    with pytest.raises(openai_fallback.OpenAIImageFallbackError, match="http_400:invalid_request_error:invalid_value:bad tool choice"):
+        openai_fallback.generate_image("make a frame", [], 120)
