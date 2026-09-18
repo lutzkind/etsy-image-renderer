@@ -161,13 +161,16 @@ def _unknown(reason: str, evidence: dict[str, Any] | None = None) -> dict[str, A
 
 def _read_rate_limits(command: list[str], timeout: float) -> dict[str, Any]:
     """Query the Codex app-server for a structured rate-limit snapshot."""
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _unknown(f"quota_probe_spawn_failed:{type(exc).__name__}")
     selector = selectors.DefaultSelector()
     assert process.stdout is not None
     assert process.stderr is not None
@@ -236,12 +239,19 @@ def _read_rate_limits(command: list[str], timeout: float) -> dict[str, Any]:
                 process.stdin.close()
         except OSError:
             pass
+        # Popen.communicate() flushes stdin before waiting.  After closing it,
+        # drop the reference so communicate() cannot raise
+        # "flush of closed file" and mask a successful probe.
+        process.stdin = None
         if process.poll() is None:
             process.terminate()
         try:
             process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            try:
+                process.kill()
+            except OSError:
+                pass
             try:
                 process.communicate()
             except (OSError, ValueError):
