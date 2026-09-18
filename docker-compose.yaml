@@ -22,6 +22,9 @@ services:
       - CODEX_AUTH_SOURCE=/run/secrets/codex-session/auth.json
       - RENDER_DATA_DIR=/data
       - CODEX_RENDER_TIMEOUT_SECONDS
+      # Paid OpenAI API image generation is disabled for production by default.
+      # Only an explicit operator override may set this to true.
+      - ALLOW_PAID_OPENAI_IMAGE_FALLBACK=${ALLOW_PAID_OPENAI_IMAGE_FALLBACK:-false}
     volumes:
       - renderer-data:/data
       # The entrypoint keeps the runtime copy current and propagates Codex's
