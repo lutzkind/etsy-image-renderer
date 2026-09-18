@@ -587,7 +587,12 @@ def test_container_and_dependencies_do_not_restore_local_compositor():
     entrypoint = (root / "runtime-entrypoint.sh").read_text(encoding="utf-8")
     combined = "\n".join((compose, dockerfile, requirements, entrypoint)).lower()
     assert "pillow" not in combined
-    assert "openai_image_fallback" not in combined
+    # No local Python compositor/fallback dependency or module may be restored.
+    # The explicit ``ALLOW_PAID_OPENAI_IMAGE_FALLBACK`` configuration flag is a
+    # spend policy toggle, not a dependency, and is allowed.
+    assert "openai_image_fallback" not in requirements
+    assert "import openai_image_fallback" not in combined
+    assert "openai_image_fallback.py" not in combined
     assert "continuing so" not in entrypoint
 
 

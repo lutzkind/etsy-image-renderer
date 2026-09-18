@@ -23,6 +23,7 @@ import hashlib
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,6 +33,20 @@ import openai_fallback
 PNG_INPUT = b"\x89PNG\r\n\x1a\ninput-artwork"
 PNG_RESULT = b"\x89PNG\r\n\x1a\n" + b"mock-provider-result"
 AUTH = {"Authorization": "Bearer secret"}
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("RENDER_DATA_DIR", str(tmp_path / "render-data"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    renderer._REQUEST_DIGESTS.clear()
+    renderer._ASYNC_JOBS.clear()
+    renderer._ASYNC_HASH_INDEX.clear()
+    renderer._ASYNC_QUEUE_IDS.clear()
+    renderer._ASYNC_STATE_RESTORED = False
+    renderer.openai_fallback.reset_quota_circuit()
+    renderer.codex_quota.reset_cache()
+    yield
 
 
 class _FakeResponse:
