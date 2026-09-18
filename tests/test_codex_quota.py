@@ -125,3 +125,43 @@ def test_status_constants_are_stable():
     assert codex_quota.STATUS_AVAILABLE == "available"
     assert codex_quota.STATUS_EXHAUSTED == "exhausted"
     assert codex_quota.STATUS_UNKNOWN == "unknown"
+
+
+FAKE_APP_SERVER = r'''
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    method = message.get("method")
+    message_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": message_id, "result": {}}), flush=True)
+    elif method == "account/rateLimits/read":
+        payload = {"id": message_id, "result": {"rateLimits": {
+            "primary": {"usedPercent": 0},
+            "secondary": {"usedPercent": 100},
+            "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+            "rateLimitReachedType": "rate_limit_reached",
+        }}}
+        print(json.dumps(payload), flush=True)
+'''
+
+
+def test_read_rate_limits_end_to_end_without_network():
+    import sys
+
+    result = codex_quota._read_rate_limits([sys.executable, "-c", FAKE_APP_SERVER], 10)
+    assert result["status"] == codex_quota.STATUS_EXHAUSTED
+    assert result["rate_limit_reached_type"] == "rate_limit_reached"
+
+
+def test_read_rate_limits_missing_command_is_unknown():
+    result = codex_quota._read_rate_limits(["/nonexistent/codex-binary"], 5)
+    assert result["status"] == codex_quota.STATUS_UNKNOWN
