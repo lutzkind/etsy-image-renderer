@@ -18,6 +18,34 @@ _DEFAULT_IMAGE_MODEL = "gpt-image-2"
 _DEFAULT_TIMEOUT_SECONDS = 900
 _DEFAULT_CIRCUIT_SECONDS = 1800
 
+# Explicit operator authorization for *paid* OpenAI image API spend.  The
+# default MUST remain false: Codex quota exhaustion never authorizes paid API
+# generation.  Only an approved operator/test/emergency override may flip it.
+PAID_FALLBACK_ENV = "ALLOW_PAID_OPENAI_IMAGE_FALLBACK"
+_TRUTHY = {"1", "true", "yes", "on", "enabled"}
+
+# Request-parameter capabilities per image model.  The Responses API hosted
+# ``image_generation`` tool rejects unsupported optional parameters with HTTP
+# 400 (for example ``input_fidelity`` on ``gpt-image-2``).  The renderer must
+# construct a request that only contains parameters the selected model
+# supports.  Unknown models fail closed rather than guessing.
+_IMAGE_MODEL_CAPABILITIES: dict[str, dict[str, bool]] = {
+    "gpt-image-2": {
+        "action": True,
+        "quality": True,
+        "size": True,
+        "output_format": True,
+        "input_fidelity": False,
+    },
+    "gpt-image-1": {
+        "action": True,
+        "quality": True,
+        "size": True,
+        "output_format": True,
+        "input_fidelity": True,
+    },
+}
+
 _QUOTA_LOCK = threading.Lock()
 _QUOTA_BLOCKED_UNTIL = 0.0
 
@@ -30,12 +58,34 @@ def configured() -> bool:
     return bool(os.environ.get("OPENAI_API_KEY", "").strip())
 
 
+def paid_fallback_authorized() -> bool:
+    """Return whether paid OpenAI API image generation is explicitly allowed."""
+    return os.environ.get(PAID_FALLBACK_ENV, "").strip().lower() in _TRUTHY
+
+
+def authorization_source() -> str:
+    return PAID_FALLBACK_ENV if paid_fallback_authorized() else "none"
+
+
+def paid_fallback_policy() -> str:
+    return "explicit_paid_authorization_only"
+
+
 def responses_model() -> str:
     return os.environ.get("OPENAI_IMAGE_FALLBACK_MODEL", _DEFAULT_RESPONSES_MODEL).strip() or _DEFAULT_RESPONSES_MODEL
 
 
 def image_model() -> str:
     return os.environ.get("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", _DEFAULT_IMAGE_MODEL).strip() or _DEFAULT_IMAGE_MODEL
+
+
+def image_model_capabilities(model: str | None = None) -> dict[str, bool]:
+    """Return the supported hosted-tool parameters for an image model."""
+    resolved = str(model or image_model()).strip().lower()
+    capabilities = _IMAGE_MODEL_CAPABILITIES.get(resolved)
+    if capabilities is None:
+        raise OpenAIImageFallbackError(f"openai_image_fallback_unsupported_image_model:{resolved or 'missing'}")
+    return dict(capabilities)
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -140,18 +190,28 @@ def _base_url() -> str:
 
 
 def _tool_config(has_inputs: bool) -> dict[str, Any]:
-    quality = os.environ.get("OPENAI_IMAGE_FALLBACK_QUALITY", "high").strip().lower() or "high"
-    if quality not in {"low", "medium", "high", "auto"}:
-        quality = "high"
-    size = os.environ.get("OPENAI_IMAGE_FALLBACK_SIZE", "auto").strip().lower() or "auto"
-    if size not in {"1024x1024", "1024x1536", "1536x1024", "auto"}:
-        size = "auto"
-    tool: dict[str, Any] = {
-        "type": "image_generation", "model": image_model(), "action": "edit" if has_inputs else "generate",
-        "quality": quality, "size": size, "output_format": "png",
-    }
-    if has_inputs:
-        tool["input_fidelity"] = "high"
+    model = image_model()
+    capabilities = image_model_capabilities(model)
+    tool: dict[str, Any] = {"type": "image_generation", "model": model}
+    if capabilities.get("action"):
+        tool["action"] = "edit" if has_inputs else "generate"
+    if capabilities.get("quality"):
+        quality = os.environ.get("OPENAI_IMAGE_FALLBACK_QUALITY", "high").strip().lower() or "high"
+        if quality not in {"low", "medium", "high", "auto"}:
+            quality = "high"
+        tool["quality"] = quality
+    if capabilities.get("size"):
+        size = os.environ.get("OPENAI_IMAGE_FALLBACK_SIZE", "auto").strip().lower() or "auto"
+        if size not in {"1024x1024", "1024x1536", "1536x1024", "auto"}:
+            size = "auto"
+        tool["size"] = size
+    if capabilities.get("output_format"):
+        tool["output_format"] = "png"
+    if has_inputs and capabilities.get("input_fidelity"):
+        fidelity = os.environ.get("OPENAI_IMAGE_FALLBACK_INPUT_FIDELITY", "high").strip().lower() or "high"
+        if fidelity not in {"low", "high"}:
+            fidelity = "high"
+        tool["input_fidelity"] = fidelity
     return tool
 
 
@@ -179,6 +239,10 @@ def generate_image(prompt: str, inputs: list[Path], request_timeout: int | None 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise OpenAIImageFallbackError("openai_image_fallback_not_configured")
+    # This is the paid-spend boundary.  Normal production must never reach a
+    # billable request merely because Codex quota is exhausted.
+    if not paid_fallback_authorized():
+        raise OpenAIImageFallbackError("openai_image_fallback_not_authorized")
     content: list[dict[str, Any]] = [{"type": "input_text", "text": str(prompt)}]
     content.extend({"type": "input_image", "image_url": _data_url(path), "detail": "high"} for path in inputs)
     payload = {

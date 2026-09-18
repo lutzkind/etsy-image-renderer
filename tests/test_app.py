@@ -25,6 +25,7 @@ def clear_state(tmp_path, monkeypatch):
     renderer._ASYNC_QUEUE_IDS.clear()
     renderer._ASYNC_STATE_RESTORED = False
     renderer.openai_fallback.reset_quota_circuit()
+    renderer.codex_quota.reset_cache()
     yield
     renderer._REQUEST_DIGESTS.clear()
     renderer._ASYNC_JOBS.clear()
@@ -32,6 +33,7 @@ def clear_state(tmp_path, monkeypatch):
     renderer._ASYNC_QUEUE_IDS.clear()
     renderer._ASYNC_STATE_RESTORED = False
     renderer.openai_fallback.reset_quota_circuit()
+    renderer.codex_quota.reset_cache()
 
 
 def card_payload(**overrides):
@@ -51,7 +53,7 @@ def card_payload(**overrides):
 
 
 def test_public_modes_are_codex_generation_only():
-    assert renderer.APP_VERSION == "1.15.0"
+    assert renderer.APP_VERSION == "1.16.0"
     assert set(renderer.ALLOWED_MODES) == {"minimal_frame", "lifestyle", "orientation", "decorative_asset", "designed_card"}
     assert "deterministic_frame" not in renderer.ALLOWED_MODES
     assert "deterministic_lifestyle" not in renderer.ALLOWED_MODES
@@ -253,7 +255,8 @@ def test_readiness_is_not_satisfied_by_another_image_provider(monkeypatch):
     status = renderer.readiness()
     assert status["ready"] is False
     assert status["api_fallback_configured"] is True
-    assert status["api_fallback_policy"] == "confirmed_codex_quota_only"
+    assert status["api_fallback_authorized"] is False
+    assert status["api_fallback_policy"] == "explicit_paid_authorization_only"
     assert status["customer_facing_generation"] == "codex_image_generation_only"
     assert status["local_visual_compositing_allowed"] is False
 
@@ -313,6 +316,7 @@ def test_render_invokes_codex_for_minimal_frame_lifestyle_and_card(monkeypatch, 
 def test_confirmed_codex_quota_uses_reference_aware_api_fallback(monkeypatch, tmp_path):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
     monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
     monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
     captured = {}
@@ -349,6 +353,7 @@ def test_confirmed_codex_quota_uses_reference_aware_api_fallback(monkeypatch, tm
 def test_openai_quota_circuit_skips_repeated_codex_calls(monkeypatch, tmp_path):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
     monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
     monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
     codex_calls = []
@@ -431,6 +436,96 @@ def test_codex_auth_failure_never_uses_api_fallback(monkeypatch, tmp_path):
     assert calls == []
 
 
+def test_codex_quota_exhaustion_without_authorization_is_zero_cost(monkeypatch, tmp_path):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.delenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", raising=False)
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    fallback_calls = []
+
+    def fake_download(url, target):
+        path = target.with_suffix(".png")
+        path.write_bytes(PNG)
+        return path
+
+    def quota_run(workspace, inputs, prompt, timeout):
+        return renderer._CodexRun(1, "", "insufficient_quota: usage limit reached", ())
+
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", quota_run)
+    monkeypatch.setattr(renderer.openai_fallback, "generate_image", lambda *args: fallback_calls.append(args))
+    response = TestClient(renderer.app).post(
+        "/render", headers=AUTH,
+        json={"mode": "minimal_frame", "input_urls": ["https://example.com/art.jpg"]},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "codex_quota_unavailable"
+    assert fallback_calls == []
+
+
+def test_codex_quota_circuit_without_authorization_never_calls_paid_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.delenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", raising=False)
+    monkeypatch.setattr(renderer, "_validate_public_https_url", lambda value: value)
+    monkeypatch.setattr(renderer, "readiness", lambda: {"ready": True})
+    fallback_calls = []
+    codex_calls = []
+
+    def fake_download(url, target):
+        path = target.with_suffix(".png")
+        path.write_bytes(PNG)
+        return path
+
+    renderer.openai_fallback.mark_codex_quota_exhausted()
+    monkeypatch.setattr(renderer, "_download_image", fake_download)
+    monkeypatch.setattr(renderer, "_run_codex_app_server", lambda *args: codex_calls.append(args) or renderer._CodexRun(0, "", "", ()))
+    monkeypatch.setattr(renderer.openai_fallback, "generate_image", lambda *args: fallback_calls.append(args))
+    response = TestClient(renderer.app).post(
+        "/render", headers=AUTH,
+        json={"mode": "minimal_frame", "input_urls": ["https://example.com/art.jpg"]},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "codex_quota_unavailable"
+    assert codex_calls == []
+    assert fallback_calls == []
+
+
+def test_quota_endpoint_exposes_state_and_paid_authorization(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.delenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", raising=False)
+    monkeypatch.setattr(
+        renderer.codex_quota, "probe",
+        lambda *args, **kwargs: {
+            "status": "exhausted", "reason": "ordinary_usage_disallowed",
+            "source": "codex_app_server_account_rateLimits_read",
+        },
+    )
+    body = TestClient(renderer.app).get("/quota", headers=AUTH).json()
+    assert body["status"] == "exhausted"
+    assert body["api_fallback_authorized"] is False
+    assert body["api_fallback_policy"] == "explicit_paid_authorization_only"
+
+
+def test_health_does_not_spawn_a_codex_quota_probe(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    monkeypatch.setattr(
+        renderer.codex_quota, "probe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("health must not probe quota")),
+    )
+    body = TestClient(renderer.app).get("/health").json()
+    assert "codex_quota" not in body
+    assert "api_fallback_authorized" in body
+
+
+def test_quota_endpoint_requires_auth(monkeypatch):
+    monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
+    response = TestClient(renderer.app).get("/quota")
+    assert response.status_code == 401
+
+
 def test_async_success_persists_provider_metadata(monkeypatch, tmp_path):
     request = renderer.RenderRequest(mode="orientation", input_urls=["https://example.com/a.jpg"])
     job_id = "provider-meta-job"
@@ -492,7 +587,12 @@ def test_container_and_dependencies_do_not_restore_local_compositor():
     entrypoint = (root / "runtime-entrypoint.sh").read_text(encoding="utf-8")
     combined = "\n".join((compose, dockerfile, requirements, entrypoint)).lower()
     assert "pillow" not in combined
-    assert "openai_image_fallback" not in combined
+    # No local Python compositor/fallback dependency or module may be restored.
+    # The explicit ``ALLOW_PAID_OPENAI_IMAGE_FALLBACK`` configuration flag is a
+    # spend policy toggle, not a dependency, and is allowed.
+    assert "openai_image_fallback" not in requirements
+    assert "import openai_image_fallback" not in combined
+    assert "openai_image_fallback.py" not in combined
     assert "continuing so" not in entrypoint
 
 
