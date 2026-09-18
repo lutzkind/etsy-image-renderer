@@ -22,13 +22,14 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import codex_quota
 import openai_fallback
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 CONTRACT_VERSION = "luxlm-render-contract-v5-codex-final-raster-personalization-contract"
 IMAGE_PIPELINE_VERSION = "1.8.0-codex-only-final-raster"
 FRESH_PROOF_SCHEMA_VERSION = "image-generation-proof-v2"
@@ -933,11 +934,23 @@ def readiness() -> dict[str, Any]:
         "image_generation": image_generation, "token_configured": bool(_token()),
         "renderer": "codex-local", "app_version": APP_VERSION, "contract_version": CONTRACT_VERSION,
         "customer_facing_generation": "codex_image_generation_only",
-        "image_provider_contract": "codex_primary_openai_api_quota_only_fallback",
+        "image_provider_contract": "codex_primary_openai_api_explicit_authorization_fallback",
         "api_fallback_configured": openai_fallback.configured(),
-        "api_fallback_policy": "confirmed_codex_quota_only",
+        "api_fallback_authorized": openai_fallback.paid_fallback_authorized(),
+        "api_fallback_policy": openai_fallback.paid_fallback_policy(),
+        "api_fallback_image_model": openai_fallback.image_model(),
         "local_visual_compositing_allowed": False,
     }
+
+
+def codex_quota_status() -> dict[str, Any]:
+    """Return the authoritative Codex quota state used by production preflight."""
+    return codex_quota.probe(_codex_app_server_command())
+
+
+def _paid_openai_fallback_ready() -> bool:
+    """Paid fallback requires both configuration and explicit authorization."""
+    return openai_fallback.configured() and openai_fallback.paid_fallback_authorized()
 
 
 def _request_hash(request: RenderRequest) -> str:
@@ -982,6 +995,8 @@ def _openai_quota_fallback(
         "provider": "openai-api",
         "fallback_used": True,
         "fallback_reason": "quota",
+        "fallback_authorized": True,
+        "fallback_authorization_source": openai_fallback.authorization_source(),
         "model": fallback_model,
     }
     with _REQUEST_DIGESTS_LOCK:
@@ -1048,10 +1063,15 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
             if reference is not None:
                 prompt_context = "The final supplied image is DESIGN REFERENCE ONLY and is inspiration-only. Do not treat it as a listing asset, do not preserve its pixels, and do not copy it exactly."
             render_prompt = _prompt(request, prompt_context)
-            if openai_fallback.quota_circuit_open() and openai_fallback.configured():
-                return _openai_quota_fallback(
-                    render_prompt, command_inputs, timeout, input_digests, request_hash
-                )
+            if openai_fallback.quota_circuit_open():
+                # Known Codex quota exhaustion.  Paid API image generation runs
+                # only with explicit authorization; otherwise this is a typed,
+                # zero-cost quota result the caller must handle as resumable.
+                if _paid_openai_fallback_ready():
+                    return _openai_quota_fallback(
+                        render_prompt, command_inputs, timeout, input_digests, request_hash
+                    )
+                raise RuntimeError("codex_quota_unavailable")
             result = _run_codex_app_server(workspace, command_inputs, render_prompt, timeout)
             outputs = _new_outputs(workspace, before, command_inputs)
             outputs.extend(path for path in result.saved_paths if path not in outputs)
@@ -1061,9 +1081,11 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
                     raise RuntimeError("codex_authentication_failed")
                 if openai_fallback.codex_quota_exhausted(combined):
                     openai_fallback.mark_codex_quota_exhausted()
-                    return _openai_quota_fallback(
-                        render_prompt, command_inputs, timeout, input_digests, request_hash
-                    )
+                    if _paid_openai_fallback_ready():
+                        return _openai_quota_fallback(
+                            render_prompt, command_inputs, timeout, input_digests, request_hash
+                        )
+                    raise RuntimeError("codex_quota_unavailable")
                 raise RuntimeError("codex_render_failed")
             event_summary = _codex_event_summary(result.stdout)
             unique: dict[str, tuple[bytes, str]] = {}
@@ -1343,6 +1365,9 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    # Deliberately no Codex process is spawned here so the container
+    # HEALTHCHECK stays fast.  The authoritative quota signal is served by the
+    # separate /quota endpoint, which the daily preflight calls explicitly.
     _restore_async_state()
     payload = readiness()
     payload.update(_fresh_capability_status())
@@ -1351,6 +1376,16 @@ def health() -> dict[str, Any]:
         payload["running_jobs"] = sum(1 for job in _ASYNC_JOBS.values() if job.get("status") == "running")
     payload["persistent_queue"] = True
     return payload
+
+
+@app.get("/quota")
+def quota(authorization: str | None = Header(default=None), x_renderer_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_auth(authorization, x_renderer_token)
+    state = codex_quota_status()
+    state["api_fallback_authorized"] = openai_fallback.paid_fallback_authorized()
+    state["api_fallback_policy"] = openai_fallback.paid_fallback_policy()
+    state["api_fallback_configured"] = openai_fallback.configured()
+    return state
 
 
 @app.post("/render")

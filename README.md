@@ -53,3 +53,28 @@ Example decorative request:
 - Result binary: `GET /render-async/{job_id}/result`
 
 Successful render responses include the renderer version, contract version, request hash, and output SHA-256.
+
+## Image provider policy
+
+Codex Image 2 (via the shared Codex session) is the only automatic renderer for
+customer-facing raster output. There is **no automatic paid fallback**:
+
+- Included Codex image capacity is required. When the authoritative
+  `account/rateLimits/read` signal reports `exhausted`, `/render-async` fails
+  with the typed error `codex_quota_unavailable` and the production daily path
+  returns a healthy zero-cost skip. The renderer never silently spends.
+- `GET /quota` returns the structured quota state
+  (`available` / `exhausted` / `unknown`), the resolved plan, window usage,
+  credit status, and whether paid fallback is authorized. It is separate from
+  `/health` so the container healthcheck stays fast.
+- The OpenAI Images API fallback remains implemented and functional, but runs
+  only when `ALLOW_PAID_OPENAI_IMAGE_FALLBACK=true` is explicitly set
+  (default `false`). Codex quota exhaustion alone never authorizes it.
+- Fallback request construction is model/API-capability aware: only parameters
+  supported by the selected image model and operation are sent (for example,
+  `input_fidelity` is omitted for `gpt-image-2`; an unknown model fails closed
+  before any request is made).
+
+Certification of the fallback is deterministic and zero-cost: unit and
+integration tests mock only the provider boundary and never make a billable
+image-generation request.
