@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -10,6 +11,7 @@ import re
 import selectors
 import shutil
 import socket
+import ssl
 import subprocess
 import queue
 import tempfile
@@ -21,7 +23,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-import httpx
 import codex_quota
 import openai_fallback
 from fastapi import FastAPI, Header, HTTPException
@@ -356,7 +357,13 @@ def _public_addresses(hostname: str) -> list[str]:
     return addresses
 
 
-def _validate_public_https_url(value: str) -> str:
+def _validated_public_url(value: str) -> tuple[str, list[str]]:
+    """Validate an HTTPS URL and return it with its resolved public addresses.
+
+    The address list is the *pinned* DNS result: callers must connect to these
+    addresses directly instead of letting the HTTP client re-resolve the
+    hostname, which closes the DNS-rebinding TOCTOU window.
+    """
     url = str(value or "").strip()
     parsed = urlparse(url)
     if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
@@ -364,8 +371,95 @@ def _validate_public_https_url(value: str) -> str:
     hostname = parsed.hostname.rstrip(".").lower()
     if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
         raise ValueError("input_url_not_public")
-    _public_addresses(hostname)
-    return url
+    return url, _public_addresses(hostname)
+
+
+def _validate_public_https_url(value: str) -> str:
+    return _validated_public_url(value)[0]
+
+
+class _InputHttpError(Exception):
+    """An upstream input URL answered with an HTTP error status."""
+
+
+class _PinnedAddressHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that dials a pre-validated IP and never re-resolves.
+
+    ``server_hostname`` keeps the original hostname for SNI and certificate
+    verification, so DNS rebinding after validation cannot redirect the
+    connection to a private address.
+    """
+
+    def __init__(self, host: str, port: int, addresses: list[str], *, timeout: float, context: ssl.SSLContext):
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._pinned_addresses = tuple(addresses)
+
+    def connect(self) -> None:
+        last_error: OSError | None = None
+        for address in self._pinned_addresses:
+            try:
+                raw_socket = socket.create_connection((address, self.port), self.timeout)
+            except OSError as exc:
+                last_error = exc
+                continue
+            try:
+                self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+            except Exception:
+                raw_socket.close()
+                raise
+            return
+        if last_error is not None:
+            raise last_error
+        raise OSError("input_host_unresolvable")
+
+
+def _pinned_https_get(url: str, addresses: list[str]) -> tuple[int, dict[str, str], bytes]:
+    """GET an already-validated HTTPS URL over a pinned validated address."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").rstrip(".").lower()
+    port = parsed.port or 443
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    connection = _PinnedAddressHTTPSConnection(
+        host, port, addresses, timeout=60, context=ssl.create_default_context()
+    )
+    try:
+        connection.request(
+            "GET",
+            target,
+            headers={
+                "Host": parsed.netloc,
+                "User-Agent": "Etsy-Codex-Renderer/1.3",
+                "Accept": "image/png,image/jpeg,image/webp",
+                "Connection": "close",
+            },
+        )
+        response = connection.getresponse()
+        data = response.read(MAX_INPUT_BYTES + 1)
+        headers = {key.lower(): value for key, value in response.getheaders()}
+        return response.status, headers, data
+    finally:
+        connection.close()
+
+
+def _atomic_write(target: Path, data: bytes) -> None:
+    """Write a validated raster atomically so no partial artifact is visible."""
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".part"
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _sniff_image(data: bytes) -> tuple[str, str]:
@@ -379,24 +473,24 @@ def _sniff_image(data: bytes) -> tuple[str, str]:
 
 
 def _download_image(url: str, target_stem: Path) -> Path:
-    current = _validate_public_https_url(url)
-    with httpx.Client(timeout=60, follow_redirects=False, headers={"User-Agent": "Etsy-Codex-Renderer/1.3", "Accept": "image/png,image/jpeg,image/webp"}) as client:
-        for _ in range(4):
-            response = client.get(current)
-            if response.status_code in {301, 302, 303, 307, 308}:
-                location = response.headers.get("location", "")
-                if not location:
-                    raise ValueError("invalid_input_redirect")
-                current = _validate_public_https_url(urljoin(current, location))
-                continue
-            response.raise_for_status()
-            data = response.content
-            if len(data) > MAX_INPUT_BYTES:
-                raise ValueError("input_image_too_large")
-            _, suffix = _sniff_image(data)
-            path = target_stem.with_suffix(suffix)
-            path.write_bytes(data)
-            return path
+    current = str(url or "")
+    for _ in range(4):
+        current, addresses = _validated_public_url(current)
+        status, headers, data = _pinned_https_get(current, addresses)
+        if status in {301, 302, 303, 307, 308}:
+            location = headers.get("location", "")
+            if not location:
+                raise ValueError("invalid_input_redirect")
+            current = urljoin(current, location)
+            continue
+        if status >= 400:
+            raise _InputHttpError(f"input_http_{status}")
+        if len(data) > MAX_INPUT_BYTES:
+            raise ValueError("input_image_too_large")
+        _, suffix = _sniff_image(data)
+        target = target_stem.with_suffix(suffix)
+        _atomic_write(target, data)
+        return target
     raise ValueError("too_many_input_redirects")
 
 
