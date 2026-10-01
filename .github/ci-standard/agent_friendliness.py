@@ -36,7 +36,6 @@ import json
 import re
 import shlex
 import subprocess
-import sys
 from pathlib import Path
 
 MAX_AGENTS_LINES = 400
