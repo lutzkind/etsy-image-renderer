@@ -1,4 +1,4 @@
-standard_version: 2.5.1
+standard_version: 2.5.2
 profile: docker-service
 default_branch: main
 self_hosted_labels:
