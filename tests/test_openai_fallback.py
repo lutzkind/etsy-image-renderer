@@ -86,6 +86,7 @@ def test_responses_fallback_forces_the_only_hosted_image_tool(monkeypatch, tmp_p
 
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
     monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
+    monkeypatch.setenv("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", "gpt-image-2")
     monkeypatch.setattr(openai_fallback.httpx, "Client", FakeClient)
     input_path = Path(tmp_path) / "art.png"
     input_path.write_bytes(b"\x89PNG\r\n\x1a\ninput")
@@ -130,6 +131,7 @@ def test_generation_request_omits_edit_only_parameters(monkeypatch, tmp_path):
 
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
     monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
+    monkeypatch.setenv("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", "gpt-image-2")
     monkeypatch.setattr(openai_fallback.httpx, "Client", lambda **kwargs: FakeClient())
 
     openai_fallback.generate_image("make a frame", [], 120)
@@ -233,6 +235,7 @@ def test_responses_fallback_preserves_bounded_provider_error_detail(monkeypatch)
 
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
     monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
+    monkeypatch.setenv("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", "gpt-image-2")
     monkeypatch.setattr(openai_fallback.httpx, "Client", lambda **kwargs: FakeClient())
     with pytest.raises(openai_fallback.OpenAIImageFallbackError, match="http_400:invalid_request_error:invalid_value:bad tool choice"):
         openai_fallback.generate_image("make a frame", [], 120)
@@ -241,6 +244,7 @@ def test_responses_fallback_preserves_bounded_provider_error_detail(monkeypatch)
 def _authorized(monkeypatch, status=200, payload=None, post=None):
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
     monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
+    monkeypatch.setenv("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", "gpt-image-2")
 
     class FakeResponse:
         status_code = status
@@ -359,6 +363,7 @@ def test_transport_failure_does_not_poison_retry(monkeypatch):
 
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
     monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
+    monkeypatch.setenv("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", "gpt-image-2")
     monkeypatch.setattr(openai_fallback.httpx, "Client", lambda **kwargs: FakeClient())
     with pytest.raises(openai_fallback.OpenAIImageFallbackError, match="transport_failed"):
         openai_fallback.generate_image("p", [], 120)
