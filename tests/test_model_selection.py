@@ -291,6 +291,15 @@ def test_resolution_cache_avoids_repeat_catalog_queries(monkeypatch):
     assert len(calls) == 1
 
 
+def test_operator_refresh_reports_the_catalog_resolution(monkeypatch):
+    monkeypatch.setattr(openai_fallback, "_fetch_image_model_catalog", lambda: LIVE_CATALOG)
+    status = openai_fallback.refresh_image_model_catalog()
+    assert status["resolved_model"] == "gpt-image-2.5-sunburst"
+    assert status["resolution_source"] == "catalog"
+    assert status["catalog_error"] == ""
+    assert status["catalog_model_count"] == len(LIVE_CATALOG)
+
+
 def test_health_reports_policy_without_network_or_codex_probe(monkeypatch):
     monkeypatch.setenv("ETSY_CODEX_RENDERER_TOKEN", "secret")
     monkeypatch.setattr(
