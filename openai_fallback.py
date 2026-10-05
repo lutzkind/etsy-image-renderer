@@ -469,8 +469,14 @@ def image_model_resolution_status() -> dict[str, Any]:
 
 def refresh_image_model_catalog() -> dict[str, Any]:
     """Force a zero-cost catalog resolution and return the resulting status."""
-    resolve_image_model(allow_network=True, force_refresh=True)
-    return image_model_resolution_status()
+    resolution = resolve_image_model(allow_network=True, force_refresh=True)
+    status = image_model_resolution_status()
+    # Report the resolution this refresh actually performed rather than the
+    # fresh cache entry that was just written.
+    status["resolved_model"] = resolution.model
+    status["resolution_source"] = resolution.source
+    status["catalog_error"] = resolution.catalog_error
+    return status
 
 
 def image_model_capabilities(model: str | None = None) -> dict[str, bool]:
