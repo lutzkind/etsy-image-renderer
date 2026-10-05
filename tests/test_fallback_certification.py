@@ -7,8 +7,9 @@ response-handling code while mocking only the network/provider boundary.
 It proves:
 
 * explicit paid authorization + Codex unavailable -> a correctly formed
-  ``gpt-image-2`` image-generation request, a mocked valid provider raster, and
-  a result the gallery path can consume; and
+  category-current image-generation request (automatic resolution selects the
+  newest stable full-capability GPT Image model), a mocked valid provider
+  raster, and a result the gallery path can consume; and
 * production default (no authorization) + Codex unavailable -> the paid
   fallback code is never invoked.
 
@@ -45,6 +46,7 @@ def isolated_runtime_state(tmp_path, monkeypatch):
     renderer._ASYNC_QUEUE_IDS.clear()
     renderer._ASYNC_STATE_RESTORED = False
     renderer.openai_fallback.reset_quota_circuit()
+    renderer.openai_fallback.reset_image_model_state()
     renderer.codex_quota.reset_cache()
     yield
 
@@ -79,18 +81,25 @@ def test_authorized_fallback_is_well_formed_and_consumable(monkeypatch, tmp_path
     captured = {}
     monkeypatch.setenv("OPENAI_API_KEY", "api-key")
     monkeypatch.setenv("ALLOW_PAID_OPENAI_IMAGE_FALLBACK", "true")
+    monkeypatch.delenv("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", raising=False)
+    monkeypatch.setattr(openai_fallback, "_fetch_image_model_catalog", lambda: [
+        {"id": "gpt-image-2", "created": 1776399795},
+        {"id": "gpt-image-2.5-flare", "created": 1788563147},
+        {"id": "gpt-image-2.5-sunburst", "created": 1788563162},
+    ])
     monkeypatch.setattr(openai_fallback.httpx, "Client", lambda **kwargs: _FakeClient(captured))
     source = Path(tmp_path) / "source.png"
     source.write_bytes(PNG_INPUT)
 
     data, mime, model = openai_fallback.generate_image("render the lifestyle scene", [source], 120)
 
-    # Request contract: GPT Image 2 reference edit without the unsupported param.
+    # Request contract: automatic resolution selects the current premium model
+    # (2.5 Sunburst) and omits the unsupported input_fidelity parameter.
     tool = captured["payload"]["tools"][0]
     assert captured["url"].endswith("/responses")
     assert tool == {
         "type": "image_generation",
-        "model": "gpt-image-2",
+        "model": "gpt-image-2.5-sunburst",
         "action": "edit",
         "quality": "high",
         "size": "auto",
@@ -102,7 +111,7 @@ def test_authorized_fallback_is_well_formed_and_consumable(monkeypatch, tmp_path
     # Response handling: a distinct, valid raster is accepted and gallery-safe.
     assert data == PNG_RESULT
     assert mime == "image/png"
-    assert model == "gpt-image-2"
+    assert model == "gpt-image-2.5-sunburst"
     digest = renderer._reject_reused_input_raster(data, {hashlib.sha256(PNG_INPUT).hexdigest()})
     assert digest == hashlib.sha256(PNG_RESULT).hexdigest()
     assert renderer._sniff_image(data)[0] == "image/png"

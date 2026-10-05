@@ -30,12 +30,19 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 CONTRACT_VERSION = "luxlm-render-contract-v5-codex-final-raster-personalization-contract"
-IMAGE_PIPELINE_VERSION = "1.8.0-codex-only-final-raster"
+IMAGE_PIPELINE_VERSION = "1.9.0-codex-provider-default-current-gpt-image"
 FRESH_PROOF_SCHEMA_VERSION = "image-generation-proof-v2"
 FRESH_PROOF_FILENAME = "fresh-render-proof.json"
 REQUIRED_FRESH_MODES = ("minimal_frame", "decorative_asset", "lifestyle", "designed_card")
+# The primary Codex path deliberately pins no numbered GPT Image generation
+# model.  Codex's built-in image_generation capability selects its current
+# supported/default GPT Image model, so a newer Images release does not
+# require a renderer source change or deployment merely to be usable.
+PRIMARY_IMAGE_PROVIDER = "codex-image"
+PRIMARY_IMAGE_MODEL_SELECTION_POLICY = "codex-provider-default"
+PROVIDER_SELECTED_MODEL_LABEL = "provider-selected"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
@@ -691,6 +698,113 @@ def _codex_event_summary(raw: str) -> str:
     return (",".join(sorted(event_types)) or "none") + ";items=" + (",".join(sorted(item_types)) or "none")
 
 
+# Keys a future Codex app-server may use to expose the actual underlying image
+# model on an ``imageGeneration`` item.  The current protocol (verified against
+# the generated 0.145.0 and 0.160.0 schemas) exposes only id/result/
+# revisedPrompt/savedPath/status/type, so truthful provenance normally reports
+# provider-managed selection instead of inventing a version.
+_CODEX_IMAGE_MODEL_KEYS = ("model", "model_id", "modelId", "image_model", "imageModel")
+
+
+def _codex_image_model_from_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    if str(item.get("type") or "").strip() not in {"imageGeneration", "image_generation"}:
+        return ""
+    containers = [item]
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        containers.append(metadata)
+    for container in containers:
+        for key in _CODEX_IMAGE_MODEL_KEYS:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:120]
+    return ""
+
+
+def _codex_event_image_model(raw: str) -> str:
+    """Return the actual image model if Codex exposes one, else ``""``.
+
+    Only ``imageGeneration`` items are inspected; the turn/thread model is the
+    mainline text model and is not evidence of the image model.
+    """
+    for line in str(raw or "").splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        item = _app_server_item(event)
+        model = _codex_image_model_from_item(item)
+        if model:
+            return model
+        params = event.get("params")
+        if isinstance(params, dict):
+            for candidate in (params.get("item"), params.get("image_generation_call")):
+                model = _codex_image_model_from_item(candidate)
+                if model:
+                    return model
+        model = _codex_image_model_from_item(event.get("item"))
+        if model:
+            return model
+    return ""
+
+
+def _codex_provider_meta(observed_model: str = "") -> dict[str, Any]:
+    """Build truthful primary-path provenance metadata.
+
+    The renderer never fabricates a numbered GPT Image model for the primary
+    Codex path.  When the event exposes the actual model it is recorded;
+    otherwise the output is reported as provider-managed selection.
+    """
+    observed = str(observed_model or "").strip()
+    return {
+        "provider": PRIMARY_IMAGE_PROVIDER,
+        "fallback_used": False,
+        "fallback_reason": "",
+        "model": observed or PROVIDER_SELECTED_MODEL_LABEL,
+        "model_observed": bool(observed),
+        "model_selection_policy": PRIMARY_IMAGE_MODEL_SELECTION_POLICY,
+        "model_configured_override": "",
+        "model_source": "codex-app-server-event" if observed else "codex-provider-managed",
+    }
+
+
+def _fallback_provider_meta(model: str) -> dict[str, Any]:
+    policy = openai_fallback.image_model_policy()
+    return {
+        "provider": "openai-api",
+        "fallback_used": True,
+        "fallback_reason": "quota",
+        "fallback_authorized": True,
+        "fallback_authorization_source": openai_fallback.authorization_source(),
+        "model": str(model or ""),
+        "model_observed": True,
+        "model_selection_policy": f"openai-api-{policy}",
+        "model_configured_override": openai_fallback.configured_override(),
+        "model_source": f"openai-api-{policy}",
+    }
+
+
+def _provider_headers(provider_meta: dict[str, Any] | None, default_provider: str = PRIMARY_IMAGE_PROVIDER) -> dict[str, str]:
+    """Return the shared truthful image-provenance response headers."""
+    meta = dict(provider_meta or {})
+    provider = str(meta.get("provider") or default_provider)
+    model = str(meta.get("model") or (PROVIDER_SELECTED_MODEL_LABEL if provider == PRIMARY_IMAGE_PROVIDER else ""))
+    policy = str(meta.get("model_selection_policy") or (PRIMARY_IMAGE_MODEL_SELECTION_POLICY if provider == PRIMARY_IMAGE_PROVIDER else ""))
+    return {
+        "X-Image-Provider": provider,
+        "X-Image-Fallback": "true" if meta.get("fallback_used") else "false",
+        "X-Image-Fallback-Reason": str(meta.get("fallback_reason") or ""),
+        "X-Image-Model": model,
+        "X-Image-Model-Selection-Policy": policy,
+        "X-Image-Model-Observed": "true" if meta.get("model_observed") else "false",
+        "X-Image-Model-Configured-Override": str(meta.get("model_configured_override") or ""),
+    }
+
+
 def _fresh_proof_path() -> Path:
     root = Path(os.environ.get("RENDER_DATA_DIR", "/data"))
     root.mkdir(parents=True, exist_ok=True)
@@ -715,7 +829,13 @@ def _proof_pipeline_version(payload: dict[str, Any]) -> str:
     return str(payload.get("app_version") or "").strip()
 
 
-def _record_fresh_proof(mode: str, request_hash: str, output_sha256: str, event_summary: str) -> None:
+def _record_fresh_proof(
+    mode: str,
+    request_hash: str,
+    output_sha256: str,
+    event_summary: str,
+    provider_meta: dict[str, Any] | None = None,
+) -> None:
     if "image_generation_call" not in event_summary:
         return
     current = _load_fresh_proof()
@@ -724,6 +844,7 @@ def _record_fresh_proof(mode: str, request_hash: str, output_sha256: str, event_
         and _proof_pipeline_version(current) == IMAGE_PIPELINE_VERSION
         and isinstance(current.get("modes"), dict)
     ) else {}
+    meta = dict(provider_meta or _codex_provider_meta())
     modes[str(mode)] = {
         "app_version": APP_VERSION,
         "image_pipeline_version": IMAGE_PIPELINE_VERSION,
@@ -731,6 +852,10 @@ def _record_fresh_proof(mode: str, request_hash: str, output_sha256: str, event_
         "request_hash": request_hash,
         "output_sha256": output_sha256,
         "event_summary": event_summary,
+        "provider": str(meta.get("provider") or ""),
+        "model": str(meta.get("model") or ""),
+        "model_observed": bool(meta.get("model_observed")),
+        "model_selection_policy": str(meta.get("model_selection_policy") or ""),
     }
     payload = {
         "schema_version": FRESH_PROOF_SCHEMA_VERSION,
@@ -755,11 +880,21 @@ def _fresh_capability_status() -> dict[str, Any]:
         and _proof_pipeline_version(modes[mode]) == IMAGE_PIPELINE_VERSION
         and "image_generation_call" in str(modes[mode].get("event_summary") or "")
     )
+    proof_provenance = {
+        mode: {
+            "provider": str((modes.get(mode) or {}).get("provider") or PRIMARY_IMAGE_PROVIDER),
+            "model": str((modes.get(mode) or {}).get("model") or PROVIDER_SELECTED_MODEL_LABEL),
+            "model_observed": bool((modes.get(mode) or {}).get("model_observed")),
+            "model_selection_policy": str((modes.get(mode) or {}).get("model_selection_policy") or PRIMARY_IMAGE_MODEL_SELECTION_POLICY),
+        }
+        for mode in verified_modes
+    }
     return {
         "fresh_render_verified": "designed_card" in verified_modes,
         "fresh_gallery_capability_verified": set(verified_modes) == set(REQUIRED_FRESH_MODES),
         "required_fresh_modes": list(REQUIRED_FRESH_MODES),
         "verified_fresh_modes": verified_modes,
+        "fresh_proof_provenance": proof_provenance,
         "image_pipeline_version": IMAGE_PIPELINE_VERSION,
         "fresh_proof_schema_version": str(proof.get("schema_version") or ""),
         "fresh_proof_app_version": str(proof.get("app_version") or ""),
@@ -1022,6 +1157,7 @@ def readiness() -> dict[str, Any]:
                     break
         except (OSError, subprocess.SubprocessError):
             pass
+    fallback_model = openai_fallback.image_model_resolution_status()
     return {
         "ready": bool(_token() and binary and authenticated and image_generation),
         "binary": bool(binary), "version": version, "authenticated": authenticated,
@@ -1029,10 +1165,20 @@ def readiness() -> dict[str, Any]:
         "renderer": "codex-local", "app_version": APP_VERSION, "contract_version": CONTRACT_VERSION,
         "customer_facing_generation": "codex_image_generation_only",
         "image_provider_contract": "codex_primary_openai_api_explicit_authorization_fallback",
+        "primary_image_provider": PRIMARY_IMAGE_PROVIDER,
+        "primary_image_model_selection_policy": PRIMARY_IMAGE_MODEL_SELECTION_POLICY,
+        "primary_image_model": PROVIDER_SELECTED_MODEL_LABEL,
+        "primary_image_model_pinned": False,
+        "primary_image_model_observed_when_available": True,
         "api_fallback_configured": openai_fallback.configured(),
         "api_fallback_authorized": openai_fallback.paid_fallback_authorized(),
         "api_fallback_policy": openai_fallback.paid_fallback_policy(),
-        "api_fallback_image_model": openai_fallback.image_model(),
+        "api_fallback_image_model": fallback_model["resolved_model"],
+        "api_fallback_image_model_policy": fallback_model["policy"],
+        "api_fallback_image_model_source": fallback_model["resolution_source"],
+        "api_fallback_image_model_override": fallback_model["configured_override"],
+        "api_fallback_image_model_baseline": fallback_model["baseline_model"],
+        "api_fallback_image_model_catalog_error": fallback_model["catalog_error"],
         "local_visual_compositing_allowed": False,
     }
 
@@ -1085,14 +1231,7 @@ def _openai_quota_fallback(
     if sniffed_mime != fallback_mime:
         fallback_mime = sniffed_mime
     fallback_digest = _reject_reused_input_raster(fallback_data, input_digests)
-    provider_meta = {
-        "provider": "openai-api",
-        "fallback_used": True,
-        "fallback_reason": "quota",
-        "fallback_authorized": True,
-        "fallback_authorization_source": openai_fallback.authorization_source(),
-        "model": fallback_model,
-    }
+    provider_meta = _fallback_provider_meta(fallback_model)
     with _REQUEST_DIGESTS_LOCK:
         if request_hash in _REQUEST_DIGESTS:
             _REQUEST_DIGESTS[request_hash].update({
@@ -1203,18 +1342,14 @@ def _render(request: RenderRequest) -> tuple[bytes, str, str, dict[str, Any]]:
             _reject_reused_input_raster(data, input_digests)
             if "image_generation_call" not in event_summary:
                 raise RuntimeError(f"image_generation_event_missing:stdout_events={event_summary}")
-            _record_fresh_proof(request.mode, request_hash, digest, event_summary)
+            provider_meta = _codex_provider_meta(_codex_event_image_model(result.stdout))
+            _record_fresh_proof(request.mode, request_hash, digest, event_summary, provider_meta)
             with _REQUEST_DIGESTS_LOCK:
                 if request_hash in _REQUEST_DIGESTS:
                     _REQUEST_DIGESTS[request_hash].update({
-                        "status": "succeeded", "output_sha256": digest,
-                        "provider": "codex-image", "fallback_used": False,
-                        "fallback_reason": "", "model": "gpt-image-2",
+                        "status": "succeeded", "output_sha256": digest, **provider_meta,
                     })
-            return data, mime, digest, {
-                "provider": "codex-image", "fallback_used": False,
-                "fallback_reason": "", "model": "gpt-image-2",
-            }
+            return data, mime, digest, dict(provider_meta)
     except Exception:
         if not async_context:
             _release_failed_request(request_hash)
@@ -1345,6 +1480,15 @@ def _restore_async_state() -> None:
         if status == "running":
             payload["status"] = "queued"
             payload["recovered_after_restart"] = True
+        # Legacy jobs persisted before the rolling-model policy may carry a
+        # fabricated primary-path ``gpt-image-2`` label.  Normalize them to
+        # truthful provider-managed provenance instead of serving stale claims.
+        if str(payload.get("provider") or "") == PRIMARY_IMAGE_PROVIDER and not str(payload.get("model_selection_policy") or ""):
+            payload["model"] = PROVIDER_SELECTED_MODEL_LABEL
+            payload["model_observed"] = False
+            payload["model_selection_policy"] = PRIMARY_IMAGE_MODEL_SELECTION_POLICY
+            payload["model_configured_override"] = ""
+            payload["model_source"] = "codex-provider-managed"
         request_hash = str(payload.get("request_hash") or "")
         with _ASYNC_JOBS_LOCK:
             _ASYNC_JOBS[job_id] = payload
@@ -1409,6 +1553,10 @@ def _run_async_job(job_id: str, request: RenderRequest) -> None:
                     "fallback_used": bool(provider_meta.get("fallback_used")),
                     "fallback_reason": str(provider_meta.get("fallback_reason") or ""),
                     "model": str(provider_meta.get("model") or ""),
+                    "model_observed": bool(provider_meta.get("model_observed")),
+                    "model_selection_policy": str(provider_meta.get("model_selection_policy") or ""),
+                    "model_configured_override": str(provider_meta.get("model_configured_override") or ""),
+                    "model_source": str(provider_meta.get("model_source") or ""),
                     "completed_at": time.time(),
                 })
                 _persist_async_job(job_id, _ASYNC_JOBS[job_id])
@@ -1448,10 +1596,13 @@ def _async_job_response(job_id: str, job: dict[str, Any]) -> JSONResponse:
         "result_url": f"/render-async/{job_id}/result",
         "mime": str(job.get("mime") or "image/png"),
         "output_sha256": str(job.get("output_sha256") or job.get("digest") or ""),
-        "provider": str(job.get("provider") or "codex-image"),
+        "provider": str(job.get("provider") or PRIMARY_IMAGE_PROVIDER),
         "fallback_used": bool(job.get("fallback_used")),
         "fallback_reason": str(job.get("fallback_reason") or ""),
-        "model": str(job.get("model") or "gpt-image-2"),
+        "model": str(job.get("model") or PROVIDER_SELECTED_MODEL_LABEL),
+        "model_observed": bool(job.get("model_observed")),
+        "model_selection_policy": str(job.get("model_selection_policy") or PRIMARY_IMAGE_MODEL_SELECTION_POLICY),
+        "model_configured_override": str(job.get("model_configured_override") or ""),
     })
     payload["composition_mode"] = "codex_generated_final_raster"
     return JSONResponse(payload, status_code=200)
@@ -1497,10 +1648,7 @@ async def render(request: RenderRequest, authorization: str | None = Header(defa
         "Cache-Control": "no-store", "X-Renderer": "codex-local", "X-Renderer-Version": APP_VERSION,
         "X-Render-Mode": request.mode, "X-Image-Sha256": digest, "X-Render-Request-Sha256": _request_hash(request),
         "X-Composition-Mode": "codex_generated_final_raster",
-        "X-Image-Provider": str(provider_meta.get("provider") or ""),
-        "X-Image-Fallback": "true" if provider_meta.get("fallback_used") else "false",
-        "X-Image-Fallback-Reason": str(provider_meta.get("fallback_reason") or ""),
-        "X-Image-Model": str(provider_meta.get("model") or ""),
+        **_provider_headers(provider_meta),
     })
 
 
@@ -1574,8 +1722,5 @@ def render_async_result(job_id: str, authorization: str | None = Header(default=
         "X-Image-Sha256": str(job.get("output_sha256") or job.get("digest") or ""),
         "X-Render-Request-Sha256": str(job.get("request_hash") or ""),
         "X-Composition-Mode": "codex_generated_final_raster",
-        "X-Image-Provider": str(job.get("provider") or "codex-image"),
-        "X-Image-Fallback": "true" if job.get("fallback_used") else "false",
-        "X-Image-Fallback-Reason": str(job.get("fallback_reason") or ""),
-        "X-Image-Model": str(job.get("model") or "gpt-image-2"),
+        **_provider_headers(job),
     })

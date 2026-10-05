@@ -25,6 +25,7 @@ def clear_state(tmp_path, monkeypatch):
     renderer._ASYNC_QUEUE_IDS.clear()
     renderer._ASYNC_STATE_RESTORED = False
     renderer.openai_fallback.reset_quota_circuit()
+    renderer.openai_fallback.reset_image_model_state()
     renderer.codex_quota.reset_cache()
     yield
     renderer._REQUEST_DIGESTS.clear()
@@ -53,7 +54,7 @@ def card_payload(**overrides):
 
 
 def test_public_modes_are_codex_generation_only():
-    assert renderer.APP_VERSION == "1.16.0"
+    assert renderer.APP_VERSION == "1.17.0"
     assert set(renderer.ALLOWED_MODES) == {"minimal_frame", "lifestyle", "orientation", "decorative_asset", "designed_card"}
     assert "deterministic_frame" not in renderer.ALLOWED_MODES
     assert "deterministic_lifestyle" not in renderer.ALLOWED_MODES

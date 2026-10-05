@@ -6,52 +6,91 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 
 MAX_FALLBACK_INPUT_BYTES = 16 * 1024 * 1024
 MAX_FALLBACK_OUTPUT_BYTES = 25 * 1024 * 1024
 _DEFAULT_RESPONSES_MODEL = "gpt-5"
-_DEFAULT_IMAGE_MODEL = "gpt-image-2"
+# Last-known-compatible fallback baseline.  The normal production path is
+# Codex's built-in image generation and never uses this module.  The paid API
+# fallback is explicitly authorized and normally resolves its image model from
+# the account's live catalog; this baseline is only used when a catalog lookup
+# is temporarily unavailable and no last successful resolution exists.  It
+# must never regress to an obsolete Image 1 family model.
+_BASELINE_IMAGE_MODEL = "gpt-image-2.5-sunburst"
 _DEFAULT_TIMEOUT_SECONDS = 900
 _DEFAULT_CIRCUIT_SECONDS = 1800
+
+# Automatic image-model resolution.  ``OPENAI_IMAGE_FALLBACK_IMAGE_MODEL`` may
+# hold an explicit exact model (emergency rollback/testing) or ``auto``
+# (equivalently: unset/empty).  In automatic mode the account model catalog is
+# queried at most once per bounded TTL and the newest stable full-capability
+# GPT Image release is selected without any source-code change for new
+# releases.
+AUTO_IMAGE_MODEL = "auto"
+_DEFAULT_CATALOG_TTL_SECONDS = 3600
+_DEFAULT_CATALOG_TIMEOUT_SECONDS = 10
+_MIN_CATALOG_TTL_SECONDS = 60
+_MAX_CATALOG_TTL_SECONDS = 86400
+_MIN_CATALOG_TIMEOUT_SECONDS = 2
+_MAX_CATALOG_TIMEOUT_SECONDS = 60
 
 # Explicit operator authorization for *paid* OpenAI image API spend.  The
 # default MUST remain false: Codex quota exhaustion never authorizes paid API
 # generation.  Only an approved operator/test/emergency override may flip it.
 PAID_FALLBACK_ENV = "ALLOW_PAID_OPENAI_IMAGE_FALLBACK"
+_IMAGE_MODEL_ENV = "OPENAI_IMAGE_FALLBACK_IMAGE_MODEL"
 _TRUTHY = {"1", "true", "yes", "on", "enabled"}
 
-# Request-parameter capabilities per image model.  The Responses API hosted
-# ``image_generation`` tool rejects unsupported optional parameters with HTTP
-# 400 (for example ``input_fidelity`` on ``gpt-image-2``).  The renderer must
-# construct a request that only contains parameters the selected model
-# supports.  Unknown models fail closed rather than guessing.
-_IMAGE_MODEL_CAPABILITIES: dict[str, dict[str, bool]] = {
-    "gpt-image-2": {
-        "action": True,
-        "quality": True,
-        "size": True,
-        "output_format": True,
-        "input_fidelity": False,
-    },
-    "gpt-image-1": {
-        "action": True,
-        "quality": True,
-        "size": True,
-        "output_format": True,
-        "input_fidelity": True,
-    },
-}
-
-_QUOTA_LOCK = threading.Lock()
-_QUOTA_BLOCKED_UNTIL = 0.0
+# GPT Image model identifiers.  The renderer never needs a per-release mapping
+# entry: the version is parsed numerically (so 2.10 > 2.9) and a future normal
+# release such as ``gpt-image-3`` or ``gpt-image-3-<variant>`` is understood
+# automatically.  Deprecated ``chatgpt-image-*`` aliases and dall-e models do
+# not match this contract and are never selected automatically.
+_GPT_IMAGE_ID = re.compile(
+    r"^gpt-image-(?P<version>\d+(?:\.\d+)*)"
+    r"(?:-(?P<variant>[a-z][a-z0-9]*))?"
+    r"(?:-(?P<snapshot>\d{4}-\d{2}-\d{2}))?$"
+)
+# Reduced-capability / non-stable identifiers never become the premium
+# default.  They remain usable only through an explicit operator pin.
+_REDUCED_CAPABILITY_TOKENS = ("mini", "preview", "experimental", "alpha", "beta")
+# Documented same-release quality siblings.  Sunburst is the most capable
+# image generation/editing model; Flare is the faster everyday model.  An
+# undecorated or unknown variant ranks at the mainstream tier and is decided
+# deterministically by release version, then created timestamp, then id.
+_VARIANT_QUALITY_TIER = {"sunburst": 30, "": 20, "flare": 10}
+_DEFAULT_VARIANT_QUALITY_TIER = 20
 
 
 class OpenAIImageFallbackError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ImageModelResolution:
+    model: str
+    policy: str
+    source: str
+    configured_override: str
+    catalog_error: str = ""
+    fetched_at: float = 0.0
+
+
+_MODEL_LOCK = threading.Lock()
+_MODEL_STATE: dict[str, Any] = {
+    "model": "",
+    "fetched_at": 0.0,
+    "catalog_error": "",
+    "catalog_size": 0,
+}
+
+_QUOTA_LOCK = threading.Lock()
+_QUOTA_BLOCKED_UNTIL = 0.0
 
 
 def configured() -> bool:
@@ -75,17 +114,20 @@ def responses_model() -> str:
     return os.environ.get("OPENAI_IMAGE_FALLBACK_MODEL", _DEFAULT_RESPONSES_MODEL).strip() or _DEFAULT_RESPONSES_MODEL
 
 
-def image_model() -> str:
-    return os.environ.get("OPENAI_IMAGE_FALLBACK_IMAGE_MODEL", _DEFAULT_IMAGE_MODEL).strip() or _DEFAULT_IMAGE_MODEL
+def image_model_setting() -> str:
+    """Return the raw image-model setting (``""`` when unset)."""
+    return os.environ.get(_IMAGE_MODEL_ENV, "").strip()
 
 
-def image_model_capabilities(model: str | None = None) -> dict[str, bool]:
-    """Return the supported hosted-tool parameters for an image model."""
-    resolved = str(model or image_model()).strip().lower()
-    capabilities = _IMAGE_MODEL_CAPABILITIES.get(resolved)
-    if capabilities is None:
-        raise OpenAIImageFallbackError(f"openai_image_fallback_unsupported_image_model:{resolved or 'missing'}")
-    return dict(capabilities)
+def image_model_policy() -> str:
+    """Return ``explicit`` for an operator pin and ``auto`` otherwise."""
+    setting = image_model_setting()
+    return "explicit" if setting and setting.lower() != AUTO_IMAGE_MODEL else "auto"
+
+
+def configured_override() -> str:
+    """Return the explicit operator pin, or ``""`` in automatic mode."""
+    return image_model_setting() if image_model_policy() == "explicit" else ""
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -94,6 +136,24 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(value, maximum))
+
+
+def catalog_ttl_seconds() -> int:
+    return _bounded_int(
+        "OPENAI_IMAGE_MODEL_CATALOG_TTL_SECONDS",
+        _DEFAULT_CATALOG_TTL_SECONDS,
+        _MIN_CATALOG_TTL_SECONDS,
+        _MAX_CATALOG_TTL_SECONDS,
+    )
+
+
+def catalog_timeout_seconds() -> int:
+    return _bounded_int(
+        "OPENAI_IMAGE_MODEL_CATALOG_TIMEOUT_SECONDS",
+        _DEFAULT_CATALOG_TIMEOUT_SECONDS,
+        _MIN_CATALOG_TIMEOUT_SECONDS,
+        _MAX_CATALOG_TIMEOUT_SECONDS,
+    )
 
 
 def timeout_seconds(request_timeout: int | None = None) -> int:
@@ -167,6 +227,12 @@ def reset_quota_circuit() -> None:
         _QUOTA_BLOCKED_UNTIL = 0.0
 
 
+def reset_image_model_state() -> None:
+    """Reset the in-process model resolution cache (tests/operator tooling)."""
+    with _MODEL_LOCK:
+        _MODEL_STATE.update({"model": "", "fetched_at": 0.0, "catalog_error": "", "catalog_size": 0})
+
+
 def _mime_for_bytes(data: bytes) -> str:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -189,8 +255,251 @@ def _base_url() -> str:
     return (os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1").rstrip("/")
 
 
-def _tool_config(has_inputs: bool) -> dict[str, Any]:
-    model = image_model()
+def _catalog_model_id(item: Any) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        return str(item.get("id") or "").strip()
+    return ""
+
+
+def _catalog_model_created(item: Any) -> int:
+    if isinstance(item, dict) and isinstance(item.get("created"), (int, float)) and not isinstance(item.get("created"), bool):
+        return int(item["created"])
+    return 0
+
+
+def _parse_gpt_image_id(model_id: str) -> re.Match[str] | None:
+    return _GPT_IMAGE_ID.match(str(model_id or "").strip().lower())
+
+
+def select_best_image_model(models: Iterable[Any]) -> str:
+    """Select the newest stable full-capability GPT Image model.
+
+    Deterministic and network-free.  Release versions are compared
+    numerically (2.10 > 2.9), not lexicographically.  Dated snapshots are
+    skipped when the undated stable alias exists; reduced-capability,
+    preview/experimental, deprecated, and non-GPT-Image identifiers are never
+    selected.  ``created`` is only a supporting tiebreak, never the semantic
+    definition of "best".
+    """
+    entries: list[dict[str, Any]] = []
+    for item in models or []:
+        model_id = _catalog_model_id(item)
+        if not model_id:
+            continue
+        lowered = model_id.lower()
+        match = _parse_gpt_image_id(lowered)
+        if match is None:
+            continue
+        if any(token in lowered for token in _REDUCED_CAPABILITY_TOKENS):
+            continue
+        if isinstance(item, dict) and item.get("deprecated") is True:
+            continue
+        entries.append({
+            "id": model_id,
+            "version": match.group("version"),
+            "variant": match.group("variant") or "",
+            "snapshot": match.group("snapshot") or "",
+            "created": _catalog_model_created(item),
+        })
+    if not entries:
+        return ""
+    undated: set[tuple[str, str]] = {
+        (entry["version"], entry["variant"]) for entry in entries if not entry["snapshot"]
+    }
+    eligible = [
+        entry for entry in entries
+        if not entry["snapshot"] or (entry["version"], entry["variant"]) not in undated
+    ]
+    eligible.sort(
+        key=lambda entry: (
+            tuple(int(part) for part in str(entry["version"]).split(".")),
+            _VARIANT_QUALITY_TIER.get(str(entry["variant"]), _DEFAULT_VARIANT_QUALITY_TIER),
+            int(entry["created"]),
+            str(entry["id"]).lower(),
+        ),
+        reverse=True,
+    )
+    return str(eligible[0]["id"])
+
+
+def _catalog_headers() -> dict[str, str]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise OpenAIImageFallbackError("openai_image_model_catalog_not_configured")
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    project = os.environ.get("OPENAI_PROJECT", "").strip()
+    organization = os.environ.get("OPENAI_ORGANIZATION", "").strip()
+    if project:
+        headers["OpenAI-Project"] = project
+    if organization:
+        headers["OpenAI-Organization"] = organization
+    return headers
+
+
+def _fetch_image_model_catalog() -> list[Any]:
+    """Fetch the account's authoritative model inventory (zero-cost)."""
+    headers = _catalog_headers()
+    try:
+        with httpx.Client(timeout=catalog_timeout_seconds()) as client:
+            response = client.get(f"{_base_url()}/models", headers=headers)
+    except httpx.HTTPError as exc:
+        raise OpenAIImageFallbackError("openai_image_model_catalog_transport_failed") from exc
+    if response.status_code >= 400:
+        raise OpenAIImageFallbackError(f"openai_image_model_catalog_http_{response.status_code}")
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise OpenAIImageFallbackError("openai_image_model_catalog_invalid_json") from exc
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        raise OpenAIImageFallbackError("openai_image_model_catalog_invalid")
+    return data
+
+
+def _cache_resolution(model: str, catalog_size: int, catalog_error: str) -> None:
+    with _MODEL_LOCK:
+        _MODEL_STATE.update({
+            "model": model,
+            "fetched_at": time.time(),
+            "catalog_error": catalog_error,
+            "catalog_size": catalog_size,
+        })
+
+
+def resolve_image_model(*, allow_network: bool = True, force_refresh: bool = False) -> ImageModelResolution:
+    """Resolve the fallback image model safely and deterministically.
+
+    Explicit operator pin wins.  Otherwise automatic mode uses the bounded
+    catalog cache, then a live (zero-cost) catalog lookup, then the last
+    successfully resolved model, then the well-defined baseline.  Resolution
+    never raises and never turns catalog uncertainty into spend authorization.
+    """
+    setting = image_model_setting()
+    if image_model_policy() == "explicit":
+        return ImageModelResolution(
+            model=setting,
+            policy="explicit",
+            source="explicit",
+            configured_override=setting,
+        )
+
+    now = time.time()
+    with _MODEL_LOCK:
+        cached_model = str(_MODEL_STATE.get("model") or "")
+        fetched_at = float(_MODEL_STATE.get("fetched_at") or 0.0)
+        catalog_error = str(_MODEL_STATE.get("catalog_error") or "")
+    cache_fresh = bool(cached_model) and (now - fetched_at) < catalog_ttl_seconds()
+    if cache_fresh and not force_refresh:
+        return ImageModelResolution(
+            model=cached_model,
+            policy="auto",
+            source="cache",
+            configured_override="",
+            catalog_error=catalog_error,
+            fetched_at=fetched_at,
+        )
+
+    error = ""
+    if allow_network:
+        try:
+            catalog = _fetch_image_model_catalog()
+            selected = select_best_image_model(catalog)
+            if not selected:
+                raise OpenAIImageFallbackError("openai_image_model_catalog_empty")
+            _cache_resolution(selected, len(catalog), "")
+            return ImageModelResolution(
+                model=selected,
+                policy="auto",
+                source="catalog",
+                configured_override="",
+                fetched_at=time.time(),
+            )
+        except Exception as exc:  # noqa: BLE001 - resolution must never fail a render
+            error = str(exc)[:200]
+
+    if cached_model:
+        return ImageModelResolution(
+            model=cached_model,
+            policy="auto",
+            source="last_known",
+            configured_override="",
+            catalog_error=error,
+            fetched_at=fetched_at,
+        )
+    return ImageModelResolution(
+        model=_BASELINE_IMAGE_MODEL,
+        policy="auto",
+        source="baseline",
+        configured_override="",
+        catalog_error=error,
+    )
+
+
+def image_model() -> str:
+    """Return the resolved fallback image model without external I/O."""
+    return resolve_image_model(allow_network=False).model
+
+
+def image_model_resolution_status() -> dict[str, Any]:
+    """Return non-secret observability for the fallback model policy.
+
+    This never performs network I/O, so it is safe for the fast ``/health``
+    probe; a live resolution happens only when an authorized fallback is about
+    to run (or when an operator explicitly refreshes it).
+    """
+    resolution = resolve_image_model(allow_network=False)
+    with _MODEL_LOCK:
+        fetched_at = float(_MODEL_STATE.get("fetched_at") or 0.0)
+        catalog_size = int(_MODEL_STATE.get("catalog_size") or 0)
+    age = max(0.0, time.time() - fetched_at) if fetched_at else None
+    return {
+        "policy": resolution.policy,
+        "setting": image_model_setting(),
+        "configured_override": resolution.configured_override,
+        "resolved_model": resolution.model,
+        "resolution_source": resolution.source,
+        "catalog_error": resolution.catalog_error,
+        "catalog_age_seconds": age,
+        "catalog_model_count": catalog_size,
+        "baseline_model": _BASELINE_IMAGE_MODEL,
+    }
+
+
+def refresh_image_model_catalog() -> dict[str, Any]:
+    """Force a zero-cost catalog resolution and return the resulting status."""
+    resolve_image_model(allow_network=True, force_refresh=True)
+    return image_model_resolution_status()
+
+
+def image_model_capabilities(model: str | None = None) -> dict[str, bool]:
+    """Return the supported hosted-tool parameters for a GPT Image model.
+
+    Capabilities are derived from the parsed GPT Image release version rather
+    than a static exact-name allowlist, so a new normal release is accepted
+    without a source change.  Non-GPT-Image identifiers still fail closed
+    before any request is sent.
+    """
+    resolved = str(model if model is not None else image_model()).strip().lower()
+    match = _parse_gpt_image_id(resolved)
+    if match is None:
+        raise OpenAIImageFallbackError(f"openai_image_fallback_unsupported_image_model:{resolved or 'missing'}")
+    version = tuple(int(part) for part in match.group("version").split("."))
+    return {
+        "action": True,
+        "quality": True,
+        "size": True,
+        "output_format": True,
+        # GPT Image 2 and later always process image inputs at high fidelity
+        # and reject ``input_fidelity``; earlier GPT Image models support it.
+        # This narrowly scoped exception is version-derived, not a per-model
+        # mapping entry.
+        "input_fidelity": version < (2,),
+    }
+
+
+def _tool_config(has_inputs: bool, model: str) -> dict[str, Any]:
     capabilities = image_model_capabilities(model)
     tool: dict[str, Any] = {"type": "image_generation", "model": model}
     if capabilities.get("action"):
@@ -243,12 +552,16 @@ def generate_image(prompt: str, inputs: list[Path], request_timeout: int | None 
     # billable request merely because Codex quota is exhausted.
     if not paid_fallback_authorized():
         raise OpenAIImageFallbackError("openai_image_fallback_not_authorized")
+    # Resolve the current compatible image model only here, at the spend
+    # boundary.  Discovery failure degrades to cache/last-known/baseline and
+    # never blocks the explicitly authorized generation.
+    resolution = resolve_image_model(allow_network=True)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": str(prompt)}]
     content.extend({"type": "input_image", "image_url": _data_url(path), "detail": "high"} for path in inputs)
     payload = {
         "model": responses_model(),
         "input": [{"role": "user", "content": content}],
-        "tools": [_tool_config(bool(inputs))],
+        "tools": [_tool_config(bool(inputs), resolution.model)],
         # Responses API hosted tools use the string form for a required call.
         # The object form is reserved for function/MCP/custom tool choices and
         # produces HTTP 400 for image_generation.
@@ -289,4 +602,4 @@ def generate_image(prompt: str, inputs: list[Path], request_timeout: int | None 
         raise OpenAIImageFallbackError("openai_image_fallback_invalid_base64") from exc
     if len(data) > MAX_FALLBACK_OUTPUT_BYTES:
         raise OpenAIImageFallbackError("openai_image_fallback_output_too_large")
-    return data, _mime_for_bytes(data), image_model()
+    return data, _mime_for_bytes(data), resolution.model
